@@ -1,0 +1,1595 @@
+"""
+District Consumer Map Builder
+Requirements: pip install folium geopandas pandas
+Usage: python build_map_tst.py
+"""
+
+import folium
+import geopandas as gpd
+import pandas as pd
+import math
+import json
+import unicodedata
+
+CONSUMERS_FILE = "consumers_with_districts.csv"
+SERVICES_FILE  = "consumers_2025_with_services_and_districts.csv"
+DISTRICTS_FILE = "house_legislative_district.geojson"
+REPORTS_FILE   = "reports_with_districts.csv"
+OUTPUT_FILE    = "district_map.html"
+LOGO_URL       = "https://centralboston.org/wp-content/themes/bb-theme-child/assets/images/logo-2.svg"
+
+WARREN = {
+    "name": "Elizabeth Warren", "title": "Senior U.S. Senator",
+    "url": "https://www.warren.senate.gov/",
+    "photo": "https://www.govtrack.us/static/legislator-photos/412542-100px.jpeg",
+    "party": "D"
+}
+MARKEY = {
+    "name": "Edward Markey", "title": "Junior U.S. Senator",
+    "url": "https://www.markey.senate.gov/",
+    "photo": "https://upload.wikimedia.org/wikipedia/commons/thumb/9/94/Edward_Markey%2C_official_portrait%2C_114th_Congress.jpg/250px-Edward_Markey%2C_official_portrait%2C_114th_Congress.jpg",
+    "party": "D"
+}
+
+SUFFOLK_TOWNS = {"BOSTON","CHELSEA","REVERE","WINTHROP","DORCHESTER","ROXBURY",
+                 "JAMAICA PLAIN","HYDE PARK","MATTAPAN","ROSLINDALE","EAST BOSTON",
+                 "SOUTH BOSTON","CHARLESTOWN","BRIGHTON","ALLSTON","WEST ROXBURY",
+                 "FENWAY","BACK BAY","BEACON HILL","SOUTH END","NORTH END"}
+
+def sanitize(name):
+    name = unicodedata.normalize("NFC", str(name or ""))
+    return name.replace(" ","_").replace("é","e").replace("ñ","n").replace("ó","o").replace("á","a").replace("í","i").replace("ú","u").replace("è","e").replace("ê","e").replace("ã","a")
+
+print("Loading data...")
+df  = pd.read_csv(CONSUMERS_FILE, dtype=str)
+gdf = gpd.read_file(DISTRICTS_FILE).to_crs("EPSG:4326")
+
+def age_bucket(a):
+    try: a = float(a)
+    except: return "Unknown"
+    if a < 65:   return "Under 65"
+    elif a < 75: return "65–74"
+    elif a < 85: return "75–84"
+    else:        return "85+"
+df["AgeBracket"] = df["AGE"].apply(age_bucket)
+
+def masshealth_bucket(val):
+    v = str(val or "").strip().lower()
+    if not v or v == "nan": return "No MassHealth"
+    return "MassHealth" if "masshealth" in v else "No MassHealth"
+df["MasshealthType"] = df["MasshealthType"].apply(masshealth_bucket)
+
+def income_bucket(row):
+    AMI = {
+        1: (34750, 57900, 92650), 2: (39700, 66200, 105850),
+        3: (44650, 74450, 119100), 4: (49600, 82700, 132300),
+        5: (53600, 89350, 142900), 6: (57550, 95950, 153500),
+    }
+    try:
+        income = float(str(row.get("AssessmentMonthly","") or "").replace(",","").replace("$","").strip()) * 12
+    except:
+        return "Unknown"
+    try:
+        hh = max(1, min(6, int(float(str(row.get("HouseholdSize","1") or "1")))))
+    except:
+        hh = 1
+    l30, l50, l80 = AMI[hh]
+    if income <= l80: return "Moderate Income"
+    else:             return "Low Income"
+df["IncomeBracket"] = df.apply(income_bucket, axis=1)
+
+df["PrimaryEthnicGroup"] = (
+    df["PrimaryEthnicGroup"].str.strip()
+    .str.replace(r"White[\s\-]*Hispanic.*", "Hispanic", regex=True, case=False)
+)
+
+def pct_breakdown(series):
+    counts = series.value_counts(dropna=False)
+    total  = counts.sum()
+    return {str(k): f"{v} ({v/total*100:.0f}%)" for k, v in counts.items() if pd.notna(k) and str(k).strip()}
+
+# ── Name corrections ──────────────────────────────────────────────────────────
+if "CC_NAME" in df.columns:
+    df["CC_NAME"] = df["CC_NAME"].str.replace("Fluker Oakley", "Fluker-Reid", regex=False)
+
+# ── Name corrections ──────────────────────────────────────────────────────────
+if "CC_NAME" in df.columns:
+    df["CC_NAME"] = df["CC_NAME"].str.replace("Fluker Oakley", "Fluker-Reid", regex=False)
+
+stats = {}
+for dist_code, group in df.groupby("DIST_CODE"):
+    stats[str(dist_code)] = {
+        "total":            len(group),
+        "lives_touched":    int(pd.to_numeric(group["HouseholdSize"], errors="coerce").fillna(1).sum()) if "HouseholdSize" in group.columns else len(group),
+        "total_meals":      0, "total_care_hours": 0.0,
+        "gender":     pct_breakdown(group["SAMSGender"]),
+        "ethnicity":  pct_breakdown(group["PrimaryEthnicGroup"]),
+        "age":        pct_breakdown(group["AgeBracket"]),
+        "masshealth": pct_breakdown(group["MasshealthType"]) if "MasshealthType" in group.columns else {},
+        "income":     pct_breakdown(group["IncomeBracket"])   if "IncomeBracket"  in group.columns else {},
+        "rep_first":  group["REP_FIRST"].iloc[0]  if "REP_FIRST"  in group.columns else "",
+        "rep_last":   group["REP_LAST"].iloc[0]   if "REP_LAST"   in group.columns else "",
+        "rep_party":  group["REP_PARTY"].iloc[0]  if "REP_PARTY"  in group.columns else "",
+        "rep_dist":   group["REP_DIST"].iloc[0]   if "REP_DIST"   in group.columns else "",
+        "rep_url":    group["URL"].iloc[0]         if "URL"        in group.columns else "",
+        "sen_first":  group["SEN_FIRST"].iloc[0]  if "SEN_FIRST"  in group.columns else "",
+        "sen_last":   group["SEN_LAST"].iloc[0]   if "SEN_LAST"   in group.columns else "",
+        "sen_party":  group["SEN_PARTY"].iloc[0]  if "SEN_PARTY"  in group.columns else "",
+        "sen_dist":   group["SEN_DIST"].iloc[0]   if "SEN_DIST"   in group.columns else "",
+        "sen_url":    group["SEN_URL"].iloc[0]     if "SEN_URL"    in group.columns else "",
+        "con_first":  group["CON_FIRST"].iloc[0]  if "CON_FIRST"  in group.columns else "",
+        "con_last":   group["CON_LAST"].iloc[0]   if "CON_LAST"   in group.columns else "",
+        "con_party":  group["CON_PARTY"].iloc[0]  if "CON_PARTY"  in group.columns else "",
+        "con_dist":   group["CON_DIST"].iloc[0]   if "CON_DIST"   in group.columns else "",
+        "con_url":    group["CON_URL"].iloc[0]    if "CON_URL"    in group.columns else "",
+        "con_dist_num": group["CON_DIST_NUM"].iloc[0] if "CON_DIST_NUM" in group.columns else "",
+        "cc_name":    group["CC_NAME"].iloc[0]    if "CC_NAME"   in group.columns else "",
+        "cc_url":     group["CC_URL"].iloc[0]     if "CC_URL"    in group.columns else "",
+        "cc_image":   group["CC_IMAGE"].iloc[0]   if "CC_IMAGE"  in group.columns else "",
+        "cc_dist":    group["CC_DIST"].iloc[0]    if "CC_DIST"   in group.columns else "",
+    }
+
+
+print("Loading service data...")
+sdf = pd.read_csv(SERVICES_FILE, dtype=str)
+sdf["_meals"] = pd.to_numeric(sdf["TOTAL_MEALS"], errors="coerce").fillna(0)
+sdf["_hours"] = pd.to_numeric(sdf["TOTAL_HOURS"], errors="coerce").fillna(0)
+sdf["DIST_CODE"] = sdf["DIST_CODE"].astype(str).str.strip()
+df["DIST_CODE"]  = df["DIST_CODE"].astype(str).str.strip()
+svc_agg = (sdf.groupby("DIST_CODE")[["_meals","_hours"]].sum()
+           .rename(columns={"_meals":"total_meals","_hours":"total_care_hours"}))
+svc_agg["total_care_hours"] = svc_agg["total_care_hours"].round(1)
+for dc, row_svc in svc_agg.iterrows():
+    dc = str(dc)
+    if dc in stats:
+        stats[dc]["total_meals"]      = int(row_svc["total_meals"])
+        stats[dc]["total_care_hours"] = float(row_svc["total_care_hours"])
+
+rdf = pd.read_csv(REPORTS_FILE, dtype=str)
+report_stats = {}
+for dist_code, group in rdf.groupby("DIST_CODE"):
+    report_stats[str(dist_code)] = {
+        "total":      len(group),
+        "allegation": pct_breakdown(group["Allegation Type"]),
+    }
+
+total_consumers   = sum(s["total"] for s in stats.values())
+total_lives       = sum(s.get("lives_touched", s["total"]) for s in stats.values())
+total_reports     = sum(s["total"] for s in report_stats.values())
+total_meals_grand = sum(s.get("total_meals", 0) for s in stats.values())
+total_hours_grand = round(sum(s.get("total_care_hours", 0.0) for s in stats.values()), 1)
+
+# ── Cost savings constants ──────────────────────────────────────────────────────
+NH_HOURLY        = 72.12   # $150k/yr nursing home / 2,080 work hrs
+HC_HOURLY        = 28.00   # MA avg home care (Genworth 2024)
+SAVINGS_PER_HOUR = NH_HOURLY - HC_HOURLY  # $44.12 saved per hour
+
+def party_color(party):
+    p = str(party).upper()
+    if "D" in p: return "#4a90d9"
+    if "R" in p: return "#e05c5c"
+    return "#a0a0b0"
+
+def get_photo_url(profile_url):
+    try:
+        leg_id = str(profile_url).strip().rstrip("/").split("/")[-1]
+        return f"https://malegislature.gov/Legislators/Profile/170/{leg_id}.jpg"
+    except: return ""
+
+def get_congress_photo_url(dist_num, last_name):
+    try:
+        num  = str(dist_num).strip().zfill(2)
+        last = str(last_name).strip().lower()
+        return f"https://ziplook.house.gov/zip/pictures/ma{num}_{last}.jpg"
+    except: return ""
+
+def legislator_card(first, last, party, district, url, label, photo_override=None):
+    col       = party_color(party)
+    photo_url = photo_override if photo_override else get_photo_url(url)
+    initials  = f"{first[:1]}{last[:1]}".upper() if first and last else "?"
+    uid       = label.replace(" ", "_")
+    return f"""
+    <div style="display:flex;align-items:center;gap:10px;background:#1a1d2e;border-radius:10px;
+                padding:10px;border:1px solid #2a3050;margin-bottom:6px;">
+      <div style="position:relative;flex-shrink:0">
+        <img id="photo_{uid}" src="{photo_url}" style="width:52px;height:52px;border-radius:50%;
+             object-fit:cover;object-position:top;border:2px solid {col};"
+             onerror="this.style.display='none';document.getElementById('avatar_{uid}').style.display='flex';" />
+        <div id="avatar_{uid}" style="display:none;width:52px;height:52px;border-radius:50%;
+             background:#0f1117;border:2px solid {col};align-items:center;justify-content:center;
+             font-size:15px;font-weight:800;color:{col}">{initials}</div>
+      </div>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:2px">{label}</div>
+        <a href="{url}" target="_blank"
+           style="display:block;font-size:13px;font-weight:800;color:#f8fafc;text-decoration:none;
+                  border-bottom:1px solid {col};line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
+          {first} {last}
+        </a>
+        <div style="font-size:10px;color:#94a3b8;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
+          {district} &nbsp;·&nbsp; <span style="color:{col};font-weight:600">{party}</span>
+        </div>
+      </div>
+    </div>"""
+
+def make_donut_svg(data_dict, colors):
+    items = []
+    for label, val_str in data_dict.items():
+        try:
+            count = int(str(val_str).split()[0])
+            if count > 0: items.append((label, count))
+        except: continue
+    if not items: return ""
+    total = sum(c for _, c in items)
+    if total == 0: return ""
+    cx, cy, r_out, r_in = 55, 55, 48, 28
+    svg_parts, legend_items = [], []
+    angle = -math.pi / 2
+    items = [(l,c) for l,c in items if c/total >= 0.005]
+    for i, (label, count) in enumerate(items):
+        pct   = count / total
+        sweep = 2 * math.pi * pct
+        x1 = cx + r_out * math.cos(angle);        y1 = cy + r_out * math.sin(angle)
+        x2 = cx + r_out * math.cos(angle+sweep);  y2 = cy + r_out * math.sin(angle+sweep)
+        x3 = cx + r_in  * math.cos(angle+sweep);  y3 = cy + r_in  * math.sin(angle+sweep)
+        x4 = cx + r_in  * math.cos(angle);        y4 = cy + r_in  * math.sin(angle)
+        large = 1 if sweep > math.pi else 0
+        color = colors[i % len(colors)]
+        path  = (f'M {x1:.2f} {y1:.2f} A {r_out} {r_out} 0 {large} 1 {x2:.2f} {y2:.2f} '
+                 f'L {x3:.2f} {y3:.2f} A {r_in} {r_in} 0 {large} 0 {x4:.2f} {y4:.2f} Z')
+        svg_parts.append(f'<path d="{path}" fill="{color}" stroke="#0f1117" stroke-width="1.5"/>')
+        legend_items.append((label, color, count, pct))
+        angle += sweep
+    legend_html = "".join(
+        f'<div style="display:flex;align-items:center;gap:5px;margin-bottom:4px">'
+        f'<div style="width:9px;height:9px;border-radius:2px;background:{c};flex-shrink:0"></div>'
+        f'<span style="color:#e2e8f0;font-size:10.5px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{l}</span>'
+        f'<span style="color:#94a3b8;font-size:10px;flex-shrink:0;margin-left:4px">{p*100:.0f}%</span></div>'
+        for l, c, n, p in legend_items
+    )
+    svg = f'<svg width="110" height="110" viewBox="0 0 110 110" style="flex-shrink:0">{"".join(svg_parts)}</svg>'
+    return (f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">'
+            f'{svg}<div style="flex:1;min-width:0">{legend_html}</div></div>')
+
+GENDER_COLORS     = ["#7dd3fc","#f9a8d4","#a5b4fc","#6ee7b7","#fde68a","#d9f99d"]
+ETHNICITY_COLORS  = ["#f59e0b","#34d399","#60a5fa","#f472b6","#a78bfa","#fb923c","#4ade80","#f87171","#e879f9","#38bdf8","#facc15","#86efac"]
+AGE_COLORS        = ["#38bdf8","#818cf8","#fb7185","#fbbf24","#34d399","#e879f9","#f97316","#a3e635","#e2e8f0","#f472b6","#4ade80","#c084fc"]
+MASSHEALTH_COLORS = ["#06b6d4","#8b5cf6","#10b981","#f59e0b","#ef4444","#ec4899","#84cc16","#f97316","#6366f1","#14b8a6"]
+INCOME_COLORS     = ["#ef4444","#fb923c","#fbbf24","#34d399","#94a3b8"]
+ALLEGATION_COLORS = ["#ef4444","#f97316","#fbbf24","#a78bfa","#60a5fa","#34d399","#f472b6","#fb923c"]
+
+def make_service_blocks_html(meals_val, hours_val):
+    if meals_val <= 0 and hours_val <= 0:
+        return ""
+    grid = "1fr 1fr" if (meals_val > 0 and hours_val > 0) else "1fr"
+    meal_saved = (
+        f'<div style="font-size:9px;font-weight:700;color:#fbbf24;margin-top:4px">'
+        f'${meals_val*11:,.0f} saved</div>'
+    ) if meals_val > 0 else ""
+    meals_block = (
+        '<div style="background:#071a0f;border-radius:8px;padding:10px;text-align:center;'
+        'border:1px solid rgba(52,211,153,0.35);">'
+        f'<div style="font-size:22px;font-weight:800;color:#34d399;line-height:1">{meals_val:,}</div>'
+        '<div style="font-size:9px;color:#6ee7b7;text-transform:uppercase;letter-spacing:0.1em;margin-top:4px">'
+        f'Home Delivered Meals</div>{meal_saved}</div>'
+    ) if meals_val > 0 else ""
+    hours_block = (
+        '<div style="background:#1a0d06;border-radius:8px;padding:10px;text-align:center;'
+        'border:1px solid rgba(251,146,60,0.35);">'
+        f'<div style="font-size:22px;font-weight:800;color:#fb923c;line-height:1">{hours_val:,.0f}</div>'
+        '<div style="font-size:9px;color:#fdba74;text-transform:uppercase;letter-spacing:0.1em;margin-top:4px">'
+        'Home Care Hours</div></div>'
+    ) if hours_val > 0 else ""
+    savings_block = ""
+    if hours_val > 0:
+        savings   = hours_val * SAVINGS_PER_HOUR
+        nh_cost   = hours_val * NH_HOURLY
+        cbes_cost = hours_val * HC_HOURLY
+        savings_block = (
+            '<div style="margin-top:10px;padding-top:10px;border-top:1px solid #1e2235;">'
+            '<div style="font-size:9px;font-weight:700;color:#34d399;text-transform:uppercase;'
+            'letter-spacing:0.1em;margin-bottom:5px">Estimated Cost Savings</div>'
+            '<div style="font-size:8px;color:#64748b;margin-bottom:5px">'
+            '$150k/yr NH / 2,080 hrs = $72.12/hr vs $28/hr CBES</div>'
+            f'<div style="background:rgba(4,24,14,.7);border:1px solid rgba(52,211,153,.3);'
+            f'border-radius:8px;padding:8px;text-align:center;margin-bottom:5px">'
+            f'<div style="font-size:22px;font-weight:900;color:#34d399;line-height:1">${savings:,.0f}</div>'
+            f'<div style="font-size:8px;color:#6ee7b7;margin-top:2px">Estimated Annual Savings</div></div>'
+            f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:5px">'
+            f'<div style="background:rgba(20,4,4,.5);border:1px solid rgba(239,68,68,.25);'
+            f'border-radius:6px;padding:6px;text-align:center">'
+            f'<div style="font-size:8px;color:#fca5a5;text-transform:uppercase;margin-bottom:2px">Without CBES</div>'
+            f'<div style="font-size:13px;font-weight:800;color:#ef4444">${nh_cost:,.0f}</div></div>'
+            f'<div style="background:rgba(4,8,24,.5);border:1px solid rgba(125,211,252,.2);'
+            f'border-radius:6px;padding:6px;text-align:center">'
+            f'<div style="font-size:8px;color:#7dd3fc;text-transform:uppercase;margin-bottom:2px">With CBES</div>'
+            f'<div style="font-size:13px;font-weight:800;color:#7dd3fc">${cbes_cost:,.0f}</div></div>'
+            f'</div></div>'
+        )
+    return (
+        '<div style="font-size:10px;font-weight:600;color:#94a3b8;text-transform:uppercase;'
+        'letter-spacing:0.1em;margin:14px 0 8px;padding-bottom:4px;border-bottom:1px solid #1e2235;">'
+        'Services Delivered</div>'
+        f'<div style="display:grid;grid-template-columns:{grid};gap:8px;margin-bottom:4px;">'
+        f'{meals_block}{hours_block}</div>{savings_block}'
+    )
+
+def make_popup(dist_code, s, total):
+    rep_card = legislator_card(s.get("rep_first",""), s.get("rep_last",""), s.get("rep_party",""), s.get("rep_dist",""), s.get("rep_url",""), "State Representative")
+    sen_card = legislator_card(s.get("sen_first",""), s.get("sen_last",""), s.get("sen_party",""), s.get("sen_dist",""), s.get("sen_url",""), "State Senator")
+    con_card = legislator_card(s.get("con_first",""), s.get("con_last",""), s.get("con_party",""), s.get("con_dist",""), s.get("con_url",""), "U.S. Representative", photo_override=get_congress_photo_url(s.get("con_dist_num",""), s.get("con_last","")))
+    cc_name  = str(s.get("cc_name","") or "")
+    if cc_name.lower() == "nan": cc_name = ""
+    cc_first = cc_name.split()[0] if cc_name else ""
+    cc_last  = " ".join(cc_name.split()[1:]) if cc_name else ""
+    cc_card  = legislator_card(cc_first, cc_last, "D", f"District {s.get('cc_dist','')}", s.get("cc_url",""), "City Councilor", photo_override=s.get("cc_image",""))
+    gender_chart     = make_donut_svg(s.get("gender",{}),     GENDER_COLORS)
+    ethnicity_chart  = make_donut_svg(s.get("ethnicity",{}),  ETHNICITY_COLORS)
+    age_chart        = make_donut_svg(s.get("age",{}),        AGE_COLORS)
+    masshealth_chart = make_donut_svg(s.get("masshealth",{}), MASSHEALTH_COLORS)
+    income_chart     = make_donut_svg(s.get("income",{}),     INCOME_COLORS)
+    service_section  = make_service_blocks_html(s.get("total_meals", 0), s.get("total_care_hours", 0.0))
+    rs = report_stats.get(dist_code, {})
+    r_total = rs.get("total", 0)
+    allegation_chart = make_donut_svg(rs.get("allegation",{}), ALLEGATION_COLORS)
+    lives = s.get("lives_touched", total)
+    if r_total > 0:
+        report_section = (
+            '<div style="margin-top:4px;border-top:2px solid #ef4444;padding-top:12px;">'
+            '<div style="font-size:11px;font-weight:800;color:#ef4444;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px;">&#9888; Elder Abuse &amp; Exploitation Reports</div>'
+            '<div style="background:#1e1018;border:1px solid rgba(239,68,68,0.2);border-radius:8px;padding:10px;text-align:center;margin-bottom:10px;">'
+            f'<div style="font-size:28px;font-weight:800;color:#ef4444;line-height:1">{r_total:,}</div>'
+            '<div style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.1em;margin-top:2px">Reports Filed</div></div>'
+            '<div style="font-size:10px;font-weight:600;color:#ef4444;text-transform:uppercase;letter-spacing:0.1em;margin:10px 0 8px;padding-bottom:4px;border-bottom:1px solid #1e2235;">Allegation Type</div>'
+            + allegation_chart + '</div>'
+        )
+    else:
+        report_section = ""
+    html = f"""<!DOCTYPE html>
+<html><head>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;600;800&display=swap" rel="stylesheet">
+<style>
+  * {{ box-sizing:border-box; margin:0; padding:0; }}
+  body {{ font-family:'DM Sans','Helvetica Neue',sans-serif; background:#0f1117; color:#e2e8f0; padding:16px; font-size:13px; }}
+  .total-block {{ background:#1e2235; border-radius:10px; padding:12px; text-align:center; margin-bottom:14px; border:1px solid #2a3050; }}
+  .total-num   {{ font-size:38px; font-weight:800; color:#7dd3fc; line-height:1; }}
+  .total-label {{ font-size:10px; color:#64748b; text-transform:uppercase; letter-spacing:0.1em; margin-top:3px; }}
+  .section-title {{ font-size:10px; font-weight:600; color:#94a3b8; text-transform:uppercase; letter-spacing:0.1em; margin:14px 0 8px; padding-bottom:4px; border-bottom:1px solid #1e2235; }}
+  .dist-badge {{ display:inline-block; font-size:10px; color:#94a3b8; letter-spacing:0.12em; text-transform:uppercase; margin-bottom:8px; }}
+</style>
+</head><body>
+  <div class="dist-badge">{dist_code}</div>
+  {con_card}{sen_card}{rep_card}{cc_card}
+  <div class="total-block">
+    <div class="total-num">{total:,}</div>
+    <div class="total-label">Consumers Served</div>
+    <div style="margin-top:10px;padding-top:10px;border-top:1px solid #2a3050;">
+      <div style="font-size:28px;font-weight:800;color:#a78bfa;line-height:1">{lives:,}</div>
+      <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.1em;margin-top:3px">Individuals Impacted</div>
+      <div style="font-size:9px;color:#4b5563;margin-top:2px">Consumers & household members touched by CBES</div>
+    </div>
+  </div>
+  {service_section}{report_section}
+  <div class="section-title">Gender Identity</div>{gender_chart}
+  <div class="section-title">Ethnicity</div>{ethnicity_chart}
+  <div class="section-title">Age Bracket</div>{age_chart}
+  <div class="section-title">MassHealth Type</div>{masshealth_chart}
+  <div class="section-title">Individual Income</div>{income_chart}
+  <div style="display:flex;justify-content:center;margin-top:16px;opacity:0.35;">
+    <img src="{LOGO_URL}" style="height:28px;" />
+  </div>
+</body></html>"""
+    return folium.Popup(folium.IFrame(html, width=330, height=1150), max_width=330)
+
+
+# ─── MAP ───────────────────────────────────────────────────────────────────────
+m = folium.Map(location=[42.36, -71.06], zoom_start=11, tiles=None)
+folium.TileLayer(tiles="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", attr="CartoDB", name="Dark", max_zoom=19).add_to(m)
+max_consumers = max((v["total"] for v in stats.values()), default=1)
+
+for _, row in gdf.iterrows():
+    dist_code = str(row.get("DIST_CODE", ""))
+    s         = stats.get(dist_code, {})
+    total     = s.get("total", 0)
+    rep_first = s.get("rep_first", "")
+    rep_last  = s.get("rep_last",  row.get("REP_LAST", ""))
+    sen_first = s.get("sen_first", "")
+    sen_last  = s.get("sen_last", "")
+    con_last  = s.get("con_last", "")
+    ccl       = sanitize(str(s.get("cc_name", "") or ""))
+    rl        = sanitize(rep_last)
+    sl        = sanitize(sen_last)
+    cl        = sanitize(con_last)
+    intensity = int(40 + 180 * (total / max_consumers)) if total > 0 else 20
+    folium.GeoJson(
+        {"type": "Feature", "properties": {"dist_code": dist_code}, "geometry": row["geometry"].__geo_interface__},
+        style_function=lambda x, c=intensity, rl=rl, sl=sl, cl=cl, ccl=ccl: {
+            "fillColor": f"rgba(125,211,252,{c/255:.2f})",
+            "color": "#2a3a5c", "weight": 1.2, "fillOpacity": 0.55,
+            "className": f"district rep-{rl} sen-{sl} con-{cl} cc-{ccl}",
+        },
+        highlight_function=lambda x: {"fillColor": "#7dd3fc", "fillOpacity": 0.85, "color": "#7dd3fc", "weight": 2.5},
+        tooltip=folium.Tooltip(
+            f"<div style='font-family:DM Sans,sans-serif;background:#0f1117;color:#f0f4ff;"
+            f"padding:8px 12px;border-radius:6px;border:1px solid #2a2d3a;font-size:13px'>"
+            f"<b>{row.get('REP_DIST','')}</b><br>"
+            f"<span style='color:#7dd3fc'>Rep: {rep_first} {rep_last}</span><br>"
+            f"<span style='color:#a5b4fc'>Sen: {sen_first} {sen_last}</span><br>"
+            f"<span style='color:#6b7280;font-size:11px'>{total} consumers</span></div>",
+            sticky=True
+        ),
+    ).add_to(m)
+
+m.get_root().html.add_child(folium.Element(f"""
+<div style="position:fixed;bottom:30px;left:20px;z-index:1000;
+    background:#0f1117cc;border:1px solid #2a2d3a;border-radius:10px;padding:10px 14px;
+    box-shadow:0 4px 20px rgba(0,0,0,0.5);backdrop-filter:blur(6px);">
+  <img src="{LOGO_URL}" style="height:36px;display:block;" />
+</div>
+"""))
+
+m.get_root().html.add_child(folium.Element("""
+<div style="position:fixed;bottom:30px;right:20px;z-index:1000;background:#0f1117;border:1px solid #2a2d3a;
+    border-radius:12px;padding:14px 18px;font-family:'DM Sans',sans-serif;color:#9ca3af;font-size:12px;
+    box-shadow:0 4px 20px rgba(0,0,0,0.5);">
+  <div style="color:#f0f4ff;font-weight:700;margin-bottom:8px;font-size:13px">Consumers per District</div>
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+    <div style="width:60px;height:12px;border-radius:3px;background:linear-gradient(to right,rgba(125,211,252,0.08),rgba(125,211,252,0.9))"></div>
+    <span>Fewer → More</span>
+  </div>
+  <div style="color:#4b5563;font-size:10px;margin-top:6px">Click district for full breakdown</div>
+</div>
+"""))
+
+
+m.get_root().html.add_child(folium.Element(f"""
+<div id="map-title-bar" style="position:fixed;top:20px;left:50%;transform:translateX(-50%);z-index:1000;
+    background:#0f1117;border:1px solid #2a2d3a;border-radius:12px;padding:10px 20px;
+    text-align:center;font-family:'DM Sans',sans-serif;box-shadow:0 4px 20px rgba(0,0,0,0.5);
+    display:flex;align-items:center;gap:14px;max-width:calc(100vw - 32px);overflow:hidden;">
+  <img src="{LOGO_URL}" style="height:30px;flex-shrink:0;" />
+  <div style="flex:1;min-width:0">
+    <div class="title-text" style="color:#f0f4ff;font-weight:800;font-size:15px;letter-spacing:0.02em;white-space:nowrap">Consumer Distribution by Legislative District</div>
+    <div class="title-subtitle" style="color:#6b7280;font-size:11px;margin-top:2px">Hover to preview · Click for full breakdown</div>
+  </div>
+  <button onclick="document.getElementById('overview-panel').style.display='flex'"
+    style="background:#1e2235;border:1px solid #2a3050;border-radius:8px;padding:6px 14px;
+    color:#f0f4ff;font-size:11px;font-weight:700;cursor:pointer;font-family:'DM Sans',sans-serif;
+    white-space:nowrap;flex-shrink:0;">
+    Overview
+  </button>
+</div>
+
+<div id="overview-panel" style="display:none;position:fixed;inset:0;z-index:2000;
+    background:rgba(0,0,0,0.75);align-items:center;justify-content:center;backdrop-filter:blur(4px);">
+  <div style="background:#0f1117;border:1px solid #2a2d3a;border-radius:16px;
+      width:min(560px,92vw);padding:28px;font-family:'DM Sans',sans-serif;position:relative;">
+    <button onclick="document.getElementById('overview-panel').style.display='none'"
+      style="position:absolute;top:16px;right:16px;background:#1e2235;border:none;color:#94a3b8;
+      border-radius:50%;width:28px;height:28px;cursor:pointer;font-size:16px;font-family:'DM Sans',sans-serif;">✕</button>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:24px;">
+      <img src="{LOGO_URL}" style="height:32px;" />
+      <div>
+        <div style="font-size:18px;font-weight:800;color:#f0f4ff">Service Area Overview</div>
+        <div style="font-size:11px;color:#64748b">All districts combined</div>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:10px;">
+      <div style="background:#1e2235;border:1px solid #2a3050;border-radius:12px;padding:16px;text-align:center;">
+        <div style="font-size:30px;font-weight:800;color:#7dd3fc;line-height:1">{total_consumers:,}</div>
+        <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.1em;margin-top:6px">Consumers Served</div>
+      </div>
+      <div style="background:#1e2235;border:1px solid #2a3050;border-radius:12px;padding:16px;text-align:center;">
+        <div style="font-size:30px;font-weight:800;color:#a78bfa;line-height:1">{total_lives:,}</div>
+        <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.1em;margin-top:6px">Individuals Impacted</div>
+      </div>
+      <div style="background:#1e1018;border:1px solid rgba(239,68,68,0.3);border-radius:12px;padding:16px;text-align:center;">
+        <div style="font-size:30px;font-weight:800;color:#ef4444;line-height:1">{total_reports:,}</div>
+        <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.1em;margin-top:6px">Abuse Reports Filed</div>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;">
+      <div style="background:#071a0f;border:1px solid rgba(52,211,153,0.35);border-radius:12px;padding:16px;text-align:center;">
+        <div style="font-size:30px;font-weight:800;color:#34d399;line-height:1">{total_meals_grand:,}</div>
+        <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.1em;margin-top:6px">Home Delivered Meals</div>
+      </div>
+      <div style="background:#1a0d06;border:1px solid rgba(251,146,60,0.35);border-radius:12px;padding:16px;text-align:center;">
+        <div style="font-size:30px;font-weight:800;color:#fb923c;line-height:1">{total_hours_grand:,.0f}</div>
+        <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.1em;margin-top:6px">Home Care Hours</div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+document.getElementById("overview-panel").addEventListener("click", function(e) {{
+  if (e.target === this) this.style.display = "none";
+}});
+</script>
+"""))
+
+
+suffolk_df = df[df["SAMSTown"].str.upper().isin(SUFFOLK_TOWNS)]
+suffolk_dist_codes = set(suffolk_df["DIST_CODE"].dropna().unique())
+
+def combined_pct_breakdown(groups_data, key):
+    from collections import Counter
+    combined = Counter()
+    for s in groups_data:
+        for label, val_str in s.get(key, {}).items():
+            try: combined[label] += int(str(val_str).split()[0])
+            except: pass
+    total = sum(combined.values())
+    if total == 0: return {}
+    return {k: f"{v} ({v/total*100:.0f}%)" for k, v in combined.most_common() if v/total >= 0.005}
+
+def build_leg_stats(leg_key, name_key, dist_key, url_key, photo_fn):
+    legs = {}
+    for dc in suffolk_dist_codes:
+        s = stats.get(str(dc), {})
+        key   = sanitize(s.get(leg_key, ""))
+        name  = f"{s.get(name_key.replace('_last','_first'),'')} {s.get(name_key,'')}".strip()
+        dist  = s.get(dist_key, "")
+        url   = s.get(url_key, "")
+        party = s.get(leg_key.replace("_last","_party"), "")
+        if not key: continue
+        if key not in legs:
+            legs[key] = {"name": name, "dist": dist, "url": url, "party": party,
+                         "photo": photo_fn(s), "dist_codes": [], "groups": []}
+        legs[key]["dist_codes"].append(dc)
+        legs[key]["groups"].append(s)
+    for key, d in legs.items():
+        d["total"]            = sum(g.get("total",0) for g in d["groups"])
+        d["lives_touched"]    = sum(g.get("lives_touched", g.get("total",0)) for g in d["groups"])
+        d["total_meals"]      = sum(g.get("total_meals", 0) for g in d["groups"])
+        d["total_care_hours"] = round(sum(g.get("total_care_hours", 0.0) for g in d["groups"]), 1)
+        d["gender"]           = combined_pct_breakdown(d["groups"], "gender")
+        d["ethnicity"]        = combined_pct_breakdown(d["groups"], "ethnicity")
+        d["age"]              = combined_pct_breakdown(d["groups"], "age")
+        d["masshealth"]       = combined_pct_breakdown(d["groups"], "masshealth")
+        d["income"]           = combined_pct_breakdown(d["groups"], "income")
+        from collections import Counter
+        rc = Counter()
+        r_total = 0
+        for dc in d["dist_codes"]:
+            rs = report_stats.get(str(dc), {})
+            r_total += rs.get("total", 0)
+            for k, v in rs.get("allegation", {}).items():
+                try: rc[k] += int(str(v).split()[0])
+                except: pass
+        rt = sum(rc.values())
+        d["r_total"] = r_total
+        d["r_allegation"] = {k: f"{v} ({v/rt*100:.0f}%)" for k,v in rc.most_common() if rt > 0 and v/rt >= 0.005}
+    return legs
+
+def build_cc_stats():
+    legs = {}
+    cc_df = suffolk_df[suffolk_df["CC_NAME"].notna() & (suffolk_df["CC_NAME"].str.lower() != "nan")]
+    for name, group in cc_df.groupby("CC_NAME"):
+        name = str(name).strip()
+        if not name: continue
+        key  = sanitize(name)
+        dist = f"District {group['CC_DIST'].iloc[0]}" if "CC_DIST" in group.columns else ""
+        url  = str(group["CC_URL"].iloc[0])   if "CC_URL"   in group.columns else ""
+        photo= str(group["CC_IMAGE"].iloc[0]) if "CC_IMAGE" in group.columns else ""
+        dist_codes = list(group["DIST_CODE"].dropna().unique())
+        from collections import Counter
+        rc = Counter()
+        r_total = 0
+        for dc in dist_codes:
+            rs = report_stats.get(str(dc), {})
+            r_total += rs.get("total", 0)
+            for k, v in rs.get("allegation", {}).items():
+                try: rc[k] += int(str(v).split()[0])
+                except: pass
+        rt = sum(rc.values())
+        svc_meals = sum(stats.get(str(dc), {}).get("total_meals", 0) for dc in dist_codes)
+        svc_hours = round(sum(stats.get(str(dc), {}).get("total_care_hours", 0.0) for dc in dist_codes), 1)
+        legs[key] = {
+            "name": name, "dist": dist, "url": url, "party": "D", "photo": photo,
+            "dist_codes": dist_codes, "total": len(group),
+            "lives_touched": int(pd.to_numeric(group["HouseholdSize"], errors="coerce").fillna(1).sum()) if "HouseholdSize" in group.columns else len(group),
+            "total_meals": svc_meals, "total_care_hours": svc_hours,
+            "gender":     pct_breakdown(group["SAMSGender"]),
+            "ethnicity":  pct_breakdown(group["PrimaryEthnicGroup"]),
+            "age":        pct_breakdown(group["AgeBracket"]),
+            "masshealth": pct_breakdown(group["MasshealthType"]) if "MasshealthType" in group.columns else {},
+            "income":     pct_breakdown(group["IncomeBracket"])   if "IncomeBracket"  in group.columns else {},
+            "r_total": r_total,
+            "r_allegation": {k: f"{v} ({v/rt*100:.0f}%)" for k,v in rc.most_common() if rt > 0 and v/rt >= 0.005},
+        }
+    return legs
+
+cc_legs  = build_cc_stats()
+con_legs = build_leg_stats("con_last","con_last","con_dist","con_url", lambda s: get_congress_photo_url(s.get("con_dist_num",""), s.get("con_last","")))
+sen_legs = build_leg_stats("sen_last","sen_last","sen_dist","sen_url", lambda s: get_photo_url(s.get("sen_url","")))
+rep_legs = build_leg_stats("rep_last","rep_last","rep_dist","rep_url", lambda s: get_photo_url(s.get("rep_url","")))
+
+def leg_js(legs):
+    out = {}
+    for key, d in legs.items():
+        out[key] = {
+            "name": d["name"], "dist": d["dist"], "url": d["url"],
+            "party": d["party"], "photo": d["photo"],
+            "dist_codes": d["dist_codes"], "total": d["total"],
+            "lives_touched":    d.get("lives_touched", d["total"]),
+            "total_meals":      d.get("total_meals", 0),
+            "total_care_hours": d.get("total_care_hours", 0.0),
+            "r_total": d.get("r_total", 0), "r_allegation": d.get("r_allegation", {}),
+            "gender": d["gender"], "ethnicity": d["ethnicity"],
+            "age": d["age"], "masshealth": d["masshealth"], "income": d.get("income", {}),
+        }
+    return json.dumps(out)
+
+con_js = leg_js(con_legs)
+sen_js = leg_js(sen_legs)
+rep_js = leg_js(rep_legs)
+cc_js  = leg_js(cc_legs)
+
+gdf_cc = gpd.read_file("city_council_districts.geojson").to_crs("EPSG:4326")
+gdf_cc = gdf_cc[["DISTRICT","Councilor","geometry"]].copy()
+cc_geo_dict = {}
+for _, row in gdf_cc.iterrows():
+    name = str(row["Councilor"] or "").strip()
+    if not name or name.lower() == "nan": continue
+    key = sanitize(name)
+    cc_geo_dict[key] = json.loads(gpd.GeoSeries([row["geometry"]]).to_json())
+cc_geo_js = json.dumps(cc_geo_dict)
+
+# ── Boston neighborhoods GeoJSON (for at-large/mayor highlighting) ─────────────
+boston_geo = gpd.read_file("boston_neighborhoods.geojson").to_crs("EPSG:4326")
+boston_geo_js = json.dumps(json.loads(boston_geo.to_json()))
+
+# ── Suffolk-wide aggregate demographics (used for at-large/citywide panels) ───
+suffolk_all_df = df[df["DIST_CODE"].isin([str(dc) for dc in suffolk_dist_codes])]
+suffolk_demo_js = json.dumps({
+    "gender":     pct_breakdown(suffolk_all_df["SAMSGender"]),
+    "ethnicity":  pct_breakdown(suffolk_all_df["PrimaryEthnicGroup"]),
+    "age":        pct_breakdown(suffolk_all_df["AgeBracket"]),
+    "masshealth": pct_breakdown(suffolk_all_df["MasshealthType"]) if "MasshealthType" in suffolk_all_df.columns else {},
+    "income":     pct_breakdown(suffolk_all_df["IncomeBracket"])   if "IncomeBracket"  in suffolk_all_df.columns else {},
+})
+
+district_data_js = json.dumps({
+    dc: {
+        "total": s["total"], "lives_touched": s.get("lives_touched", s["total"]),
+        "total_meals": s.get("total_meals", 0), "total_care_hours": s.get("total_care_hours", 0.0),
+        "gender": s.get("gender",{}), "ethnicity": s.get("ethnicity",{}),
+        "age": s.get("age",{}), "masshealth": s.get("masshealth",{}), "income": s.get("income",{}),
+        "rep_first": s.get("rep_first",""), "rep_last": s.get("rep_last",""),
+        "rep_party": s.get("rep_party",""), "rep_dist": s.get("rep_dist",""), "rep_url": s.get("rep_url",""),
+        "sen_first": s.get("sen_first",""), "sen_last": s.get("sen_last",""),
+        "sen_party": s.get("sen_party",""), "sen_dist": s.get("sen_dist",""), "sen_url": s.get("sen_url",""),
+        "con_first": s.get("con_first",""), "con_last": s.get("con_last",""),
+        "con_party": s.get("con_party",""), "con_dist": s.get("con_dist",""),
+        "con_url": s.get("con_url",""), "con_dist_num": s.get("con_dist_num",""),
+        "cc_name": s.get("cc_name",""), "cc_dist": s.get("cc_dist",""),
+        "cc_url": s.get("cc_url",""), "cc_image": s.get("cc_image",""),
+        "r_total": report_stats.get(dc, {}).get("total", 0),
+        "r_allegation": report_stats.get(dc, {}).get("allegation", {}),
+    }
+    for dc, s in stats.items()
+})
+
+
+m.get_root().html.add_child(folium.Element(f"""
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;600;800&display=swap');
+  .filter-btn {{
+    background:#1a1d2e;border:1px solid #2a3050;border-radius:7px;padding:7px 10px;
+    color:#cbd5e1;font-size:11px;font-weight:600;cursor:pointer;text-align:left;
+    display:flex;align-items:center;gap:7px;width:100%;margin-bottom:4px;
+    font-family:'DM Sans',sans-serif;transition:all 0.15s;
+  }}
+  .filter-btn:hover {{ background:#252840; color:#f0f4ff; }}
+  .filter-btn.active {{ border-color:var(--accent);background:color-mix(in srgb,var(--accent) 18%,#1a1d2e);color:#f0f4ff; }}
+  .fsec-title {{ font-size:9px;letter-spacing:0.1em;text-transform:uppercase;margin:10px 0 5px;font-weight:700; }}
+  #map-title-bar .title-subtitle {{ display:block; }}
+  @media (max-width:640px) {{
+    #map-title-bar {{ padding:8px 12px !important; gap:8px !important; }}
+    #map-title-bar .title-text {{ font-size:12px !important; }}
+    #map-title-bar .title-subtitle {{ display:none; }}
+    #map-title-bar img {{ height:22px !important; }}
+  }}
+  #filter-panel {{
+    position:fixed;top:80px;left:20px;z-index:1000;
+    background:#0f1117;border:1px solid #2a2d3a;border-radius:12px;padding:14px;
+    font-family:'DM Sans',sans-serif;box-shadow:0 4px 24px rgba(0,0,0,0.6);
+    width:200px;max-height:calc(100vh - 120px);overflow-y:auto;transition:transform 0.3s ease;
+  }}
+  #filter-toggle {{
+    display:none;position:fixed;bottom:90px;left:16px;z-index:1002;
+    background:#0f1117;border:1px solid #2a2d3a;border-radius:50%;
+    width:46px;height:46px;color:#f0f4ff;font-size:22px;cursor:pointer;
+    box-shadow:0 4px 16px rgba(0,0,0,0.7);align-items:center;justify-content:center;
+  }}
+  #stats-panel {{
+    position:fixed;right:20px;top:80px;z-index:1000;width:380px;
+    background:#0f1117;border:1px solid #2a2d3a;border-radius:14px;
+    box-shadow:0 8px 32px rgba(0,0,0,0.7);font-family:'DM Sans',sans-serif;
+    max-height:calc(100vh - 120px);overflow-y:auto;
+    transform:translateX(calc(100% + 40px));transition:transform 0.3s ease;pointer-events:none;
+  }}
+  #stats-panel.open {{ transform:translateX(0);pointer-events:auto; }}
+  .sp-header {{ padding:16px 16px 0; }}
+  .sp-body {{ padding:0 16px 16px; }}
+  .sp-close {{
+    position:sticky;top:0;float:right;background:#1e2235;border:none;
+    color:#94a3b8;border-radius:50%;width:28px;height:28px;cursor:pointer;
+    font-size:16px;display:flex;align-items:center;justify-content:center;font-family:'DM Sans',sans-serif;
+    z-index:10;margin:-4px -4px 0 0;flex-shrink:0;
+  }}
+  .sp-close:hover {{ color:#f0f4ff; }}
+  .sp-section {{ font-size:10px;font-weight:800;color:#94a3b8;text-transform:uppercase;
+                  letter-spacing:0.08em;margin:14px 0 6px;padding-bottom:5px;border-bottom:1px solid #2a3050; }}
+  @media (max-width:640px) {{
+    #filter-panel {{ top:auto !important;bottom:0;left:0;right:0;width:100% !important;
+      max-height:65vh;border-radius:16px 16px 0 0;border-bottom:none;transform:translateY(100%); }}
+    #filter-panel.open {{ transform:translateY(0); }}
+    #filter-toggle {{ display:flex; }}
+    #stats-panel {{ right:0 !important;left:0 !important;top:auto !important;bottom:0 !important;
+      width:100% !important;max-height:72vh;border-radius:16px 16px 0 0;border-bottom:none;
+      transform:translateY(100%) !important; }}
+    #stats-panel.open {{ transform:translateY(0) !important; }}
+    .leaflet-bottom.leaflet-right {{ display:none; }}
+  }}
+</style>
+
+<div id="filter-panel">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+    <div style="display:flex;align-items:center;gap:8px;">
+      <img src="https://centralboston.org/wp-content/themes/bb-theme-child/assets/images/logo-2.svg" style="height:22px;" />
+      <div style="color:#f0f4ff;font-weight:800;font-size:11px;letter-spacing:0.06em;text-transform:uppercase">Suffolk County</div>
+    </div>
+    <button onclick="clearFilter()" style="background:none;border:none;color:#64748b;font-size:10px;cursor:pointer;font-family:'DM Sans',sans-serif;">Clear</button>
+  </div>
+  <div class="fsec-title" style="color:#e2e8f0">U.S. Senator</div>
+  <div id="sen-us-btns"></div>
+  <div class="fsec-title" style="color:#06b6d4">U.S. Representative</div>
+  <div id="con-btns"></div>
+  <div class="fsec-title" style="color:#a78bfa">State Senator</div>
+  <div id="sen-btns"></div>
+  <div class="fsec-title" style="color:#4a90d9">State Representative</div>
+  <div id="rep-btns"></div>
+  <div class="fsec-title" style="color:#f472b6">Mayor &amp; At-Large</div>
+  <div id="atlarge-btns"></div>
+  <div class="fsec-title" style="color:#f59e0b">City Councilor</div>
+  <div id="cc-btns"></div>
+</div>
+
+<button id="filter-toggle" title="Filter by legislator">☰</button>
+
+<div id="stats-panel">
+  <div class="sp-header">
+    <button class="sp-close" onclick="clearFilter()">✕</button>
+    <div id="sp-leg-card" style="margin-bottom:14px;"></div>
+    <div id="sp-total-block" style="background:#1e2235;border-radius:10px;padding:12px;text-align:center;margin-bottom:4px;border:1px solid #2a3050;"></div>
+    <div id="sp-services" style="margin-top:8px;"></div>
+    <div id="sp-reports" style="margin-top:8px;"></div>
+  </div>
+  <div class="sp-body">
+    <div class="sp-section">Gender Identity</div><div id="sp-gender"></div>
+    <div class="sp-section">Ethnicity</div><div id="sp-ethnicity"></div>
+    <div class="sp-section">Age Group</div><div id="sp-age"></div>
+    <div class="sp-section">MassHealth</div><div id="sp-masshealth"></div>
+    <div class="sp-section">Income Level</div><div id="sp-income"></div>
+  </div>
+</div>
+
+<script>
+const DISTRICT_DATA = {district_data_js};
+const CON_DATA = {con_js};
+const SEN_DATA = {sen_js};
+const REP_DATA = {rep_js};
+const CC_DATA  = {cc_js};
+const CC_GEO   = {cc_geo_js};
+const BOSTON_GEO   = {boston_geo_js};
+const SUFFOLK_DEMO = {suffolk_demo_js};
+const COLORS   = {{con:"#06b6d4", sen:"#a78bfa", rep:"#4a90d9", cc:"#f59e0b", atlarge:"#f472b6"}};
+
+// Hardcoded citywide/statewide aggregate
+const CITY_AGGS = {{
+  total: 12543, lives_touched: 15678,
+  total_meals: 745360, total_care_hours: 1770000,
+  r_total: 3547, r_allegation: {{}},
+  gender: SUFFOLK_DEMO.gender, ethnicity: SUFFOLK_DEMO.ethnicity,
+  age: SUFFOLK_DEMO.age, masshealth: {{"MassHealth": "92 (92%)", "No MassHealth": "8 (8%)"}}, income: SUFFOLK_DEMO.income,
+}};
+
+let activeBtn = null, activeType = null, _ccLayer = null;
+
+function getMap() {{ return window[document.querySelector(".folium-map").id.replace(/-/g,"_")]; }}
+function partyColor(p) {{
+  if (!p) return "#a0a0b0";
+  if (p.toUpperCase().includes("D")) return "#4a90d9";
+  if (p.toUpperCase().includes("R")) return "#e05c5c";
+  return "#a0a0b0";
+}}
+const _btnTimers = new Map();
+function buildButtons(data, type, containerId) {{
+  const container = document.getElementById(containerId);
+  const color = COLORS[type];
+  Object.entries(data)
+    .sort((a,b) => a[1].name.split(" ").pop().localeCompare(b[1].name.split(" ").pop()))
+    .forEach(([key, d]) => {{
+      const btn = document.createElement("button");
+      btn.className = "filter-btn";
+      btn.style.setProperty("--accent", color);
+      btn.innerHTML = `<span style="width:7px;height:7px;border-radius:50%;background:${{color}};flex-shrink:0"></span>${{d.name}}`;
+      btn.addEventListener('click', () => {{
+        if (_btnTimers.has(btn)) {{
+          clearTimeout(_btnTimers.get(btn)); _btnTimers.delete(btn);
+          showDrilldownForLeg(d, type, color);
+        }} else {{
+          _btnTimers.set(btn, setTimeout(() => {{ _btnTimers.delete(btn); filterBy(type, key, btn, d); }}, 300));
+        }}
+      }});
+      container.appendChild(btn);
+    }});
+}}
+
+(function() {{
+  const senContainer = document.getElementById("sen-us-btns");
+  const senators = [
+    {{ name: "Elizabeth Warren", title: "Senior U.S. Senator", url: "https://www.warren.senate.gov/", photo: "https://www.govtrack.us/static/legislator-photos/412542-100px.jpeg" }},
+    {{ name: "Edward Markey", title: "Junior U.S. Senator", url: "https://www.markey.senate.gov/", photo: "https://upload.wikimedia.org/wikipedia/commons/thumb/9/94/Edward_Markey%2C_official_portrait%2C_114th_Congress.jpg/250px-Edward_Markey%2C_official_portrait%2C_114th_Congress.jpg" }}
+  ];
+  senators.forEach(s => {{
+    const btn = document.createElement("button");
+    btn.className = "filter-btn";
+    btn.style.setProperty("--accent", "#e2e8f0");
+    btn.innerHTML = `<span style="width:7px;height:7px;border-radius:50%;background:#e2e8f0;flex-shrink:0"></span>${{s.name}}`;
+    btn.onclick = () => {{
+      if (activeBtn === btn) {{ clearFilter(); return; }}
+      if (activeBtn) activeBtn.classList.remove("active");
+      activeBtn = btn; btn.classList.add("active");
+      const initials = s.name.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase();
+      document.getElementById("sp-leg-card").innerHTML = `
+        <div style="display:flex;align-items:center;gap:12px;border-left:4px solid #e2e8f0;padding-left:10px;margin-bottom:8px;">
+          <div style="position:relative;flex-shrink:0">
+            <img src="${{s.photo}}" style="width:52px;height:52px;border-radius:50%;object-fit:cover;object-position:top;border:2px solid #e2e8f0;"
+                 onerror="this.style.display='none';this.nextElementSibling.style.display='flex';" />
+            <div style="display:none;width:52px;height:52px;border-radius:50%;background:#1e2235;border:2px solid #e2e8f0;align-items:center;justify-content:center;font-size:16px;font-weight:800;color:#e2e8f0">${{initials}}</div>
+          </div>
+          <div>
+            <div style="font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:0.1em">${{s.title}}</div>
+            <a href="${{s.url}}" target="_blank" style="display:block;font-size:15px;font-weight:800;color:#f8fafc;text-decoration:none;border-bottom:1px solid #e2e8f0;margin:2px 0;line-height:1.3">${{s.name}}</a>
+            <div style="font-size:11px;color:#94a3b8"><span style="color:#4a90d9;font-weight:600">D</span> · Massachusetts Statewide</div>
+          </div>
+        </div>`;
+      const allD = Object.values(DISTRICT_DATA);
+      function sumKeys(key) {{ const out={{}}; allD.forEach(d=>{{ Object.entries(d[key]||{{}}).forEach(([k,v])=>{{ out[k]=(out[k]||0)+parseInt(v||0); }}); }}); return out; }}
+      const rAlleg = (()=>{{ const o={{}}; allD.forEach(d=>{{ Object.entries(d.r_allegation||{{}}).forEach(([k,v])=>{{ o[k]=(o[k]||0)+parseInt(v||0); }}); }}); return o; }})();
+      const aggD = {{
+        total: {total_consumers}, lives_touched: {total_lives},
+        total_meals: {total_meals_grand}, total_care_hours: {total_hours_grand},
+        r_total: {total_reports}, r_allegation: rAlleg,
+        gender: sumKeys('gender'), ethnicity: sumKeys('ethnicity'), age: sumKeys('age'),
+        masshealth: sumKeys('masshealth'), income: sumKeys('income'),
+      }};
+      fillStatsPanelCharts(CITY_AGGS);
+    }};
+    senContainer.appendChild(btn);
+  }});
+}})();
+buildButtons(CON_DATA,"con","con-btns");
+buildButtons(SEN_DATA,"sen","sen-btns");
+buildButtons(REP_DATA,"rep","rep-btns");
+
+// ── Thomas M. Stanley – hardcoded rep with citywide data ──────────────────────
+(function() {{
+  const container = document.getElementById("rep-btns");
+  const color = COLORS.rep;
+  const stanley = {{
+    name: "Thomas M. Stanley",
+    title: "State Representative · 9th Middlesex District",
+    subtitle: "Chairperson, Joint Committee on Aging and Independence",
+    url: "https://malegislature.gov/Legislators/Profile/TMS1",
+    photo: "https://malegislature.gov/Legislators/Profile/170/TMS1.jpg",
+    party: "D"
+  }};
+  const btn = document.createElement("button");
+  btn.className = "filter-btn";
+  btn.style.setProperty("--accent", color);
+  btn.innerHTML = `<span style="width:7px;height:7px;border-radius:50%;background:${{color}};flex-shrink:0"></span>${{stanley.name}}`;
+  const _showStanley = () => {{
+    if (activeBtn === btn) {{ clearFilter(); return; }}
+    if (activeBtn) activeBtn.classList.remove("active");
+    activeBtn = btn; btn.classList.add("active");
+    const theMap = getMap();
+    if (_ccLayer && theMap) {{ theMap.removeLayer(_ccLayer); _ccLayer = null; }}
+    document.querySelectorAll(".district").forEach(el => {{ el.style.fillOpacity="0.06"; el.style.opacity="0.3"; }});
+    if (theMap) {{
+      _ccLayer = L.geoJSON(BOSTON_GEO, {{ style: {{ fillColor:color, color:color, weight:3, fillOpacity:0.35, opacity:1 }} }}).addTo(theMap);
+      if (window.innerWidth <= 640) {{
+        theMap.fitBounds(_ccLayer.getBounds(), {{paddingTopLeft:[20,80], paddingBottomRight:[20, Math.round(window.innerHeight*0.72)]}});
+      }} else {{ theMap.fitBounds(_ccLayer.getBounds(), {{padding:[60,60]}}); }}
+    }}
+    const initials = stanley.name.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase();
+    document.getElementById("sp-leg-card").innerHTML = `
+      <div style="display:flex;align-items:center;gap:12px;border-left:4px solid ${{color}};padding-left:10px;margin-bottom:8px;">
+        <div style="position:relative;flex-shrink:0">
+          <img src="${{stanley.photo}}" style="width:52px;height:52px;border-radius:50%;object-fit:cover;object-position:top;border:2px solid ${{color}};"
+               onerror="this.style.display='none';this.nextElementSibling.style.display='flex';" />
+          <div style="display:none;width:52px;height:52px;border-radius:50%;background:#1e2235;border:2px solid ${{color}};align-items:center;justify-content:center;font-size:16px;font-weight:800;color:${{color}}">${{initials}}</div>
+        </div>
+        <div>
+          <div style="font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:0.1em">${{stanley.title}}</div>
+          <a href="${{stanley.url}}" target="_blank" style="display:block;font-size:15px;font-weight:800;color:#f8fafc;text-decoration:none;border-bottom:1px solid ${{color}};margin:2px 0;line-height:1.3">${{stanley.name}}</a>
+          <div style="font-size:10px;color:#7dd3fc;font-weight:700;margin-top:2px">${{stanley.subtitle}}</div>
+        </div>
+      </div>`;
+    fillStatsPanelCharts(CITY_AGGS);
+  }};
+  btn.addEventListener('click', () => {{
+    if (_btnTimers.has(btn)) {{
+      clearTimeout(_btnTimers.get(btn)); _btnTimers.delete(btn);
+      _renderDrilldown(stanley.name, stanley.title, '9th Middlesex District', 'D', stanley.url, stanley.photo, '', CITY_AGGS);
+    }} else {{
+      _btnTimers.set(btn, setTimeout(() => {{ _btnTimers.delete(btn); _showStanley(); }}, 300));
+    }}
+  }});
+  container.appendChild(btn);
+}})();
+buildButtons(CC_DATA, "cc", "cc-btns");
+
+// ── Mayor & At-Large Councilors ───────────────────────────────────────────────
+(function() {{
+  const container = document.getElementById("atlarge-btns");
+  const color = COLORS.atlarge;
+  const people = [
+    {{ name:"Michelle Wu", title:"Mayor of Boston", url:"https://www.boston.gov/departments/mayors-office/michelle-wu",
+       photo:"https://www.boston.gov/sites/default/files/styles/person_photo_profile_large_360x360_/public/img/library/photos/2021/11/wu-headshot-square.png?itok=eOMqh7V9", party:"D" }},
+    {{ name:"Ruthzee Louijeune", title:"At-Large City Councilor", url:"https://www.boston.gov/departments/city-council/ruthzee-louijeune",
+       photo:"https://www.boston.gov/sites/default/files/styles/person_photo_profile_large_360x360_/public/img/library/photos/2026/02/ruthzee-headshot.png?itok=8414Y7_7", party:"D" }},
+    {{ name:"Julia M. Mejia", title:"At-Large City Councilor", url:"https://www.boston.gov/departments/city-council/julia-mejia",
+       photo:"https://www.boston.gov/sites/default/files/styles/person_photo_profile_large_360x360_/public/img/library/photos/2026/02/mejia-headshot.png?itok=RNUWv0Q7", party:"D" }},
+    {{ name:"Erin J. Murphy", title:"At-Large City Councilor", url:"https://www.boston.gov/departments/city-council/erin-j-murphy",
+       photo:"https://www.boston.gov/sites/default/files/styles/person_photo_profile_large_360x360_/public/img/library/photos/2026/02/murphy-headshot.png?itok=-o8zeYww", party:"D" }},
+    {{ name:"Henry Santana", title:"At-Large City Councilor", url:"https://www.boston.gov/departments/city-council/henry-santana",
+       photo:"https://www.boston.gov/sites/default/files/styles/person_photo_profile_large_360x360_/public/img/library/photos/2026/02/santana-headshot.jpg?itok=yXwSDXzn", party:"D" }},
+  ];
+  people.forEach(p => {{
+    const btn = document.createElement("button");
+    btn.className = "filter-btn";
+    btn.style.setProperty("--accent", color);
+    btn.innerHTML = `<span style="width:7px;height:7px;border-radius:50%;background:${{color}};flex-shrink:0"></span>${{p.name}}`;
+    const _showAtLarge = () => {{
+      if (activeBtn === btn) {{ clearFilter(); return; }}
+      if (activeBtn) activeBtn.classList.remove("active");
+      activeBtn = btn; btn.classList.add("active");
+      const theMap = getMap();
+      if (_ccLayer && theMap) {{ theMap.removeLayer(_ccLayer); _ccLayer = null; }}
+      document.querySelectorAll(".district").forEach(el => {{ el.style.fillOpacity="0.06"; el.style.opacity="0.3"; }});
+      if (theMap) {{
+        _ccLayer = L.geoJSON(BOSTON_GEO, {{ style: {{ fillColor:color, color:color, weight:3, fillOpacity:0.35, opacity:1 }} }}).addTo(theMap);
+        if (window.innerWidth <= 640) {{
+          theMap.fitBounds(_ccLayer.getBounds(), {{paddingTopLeft:[20,80], paddingBottomRight:[20, Math.round(window.innerHeight*0.72)]}});
+        }} else {{ theMap.fitBounds(_ccLayer.getBounds(), {{padding:[60,60]}}); }}
+      }}
+      const initials = p.name.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase();
+      document.getElementById("sp-leg-card").innerHTML = `
+        <div style="display:flex;align-items:center;gap:12px;border-left:4px solid ${{color}};padding-left:10px;margin-bottom:8px;">
+          <div style="position:relative;flex-shrink:0">
+            <img src="${{p.photo}}" style="width:52px;height:52px;border-radius:50%;object-fit:cover;object-position:top;border:2px solid ${{color}};"
+                 onerror="this.style.display='none';this.nextElementSibling.style.display='flex';" />
+            <div style="display:none;width:52px;height:52px;border-radius:50%;background:#1e2235;border:2px solid ${{color}};align-items:center;justify-content:center;font-size:16px;font-weight:800;color:${{color}}">${{initials}}</div>
+          </div>
+          <div>
+            <div style="font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:0.1em">${{p.title}}</div>
+            <a href="${{p.url}}" target="_blank" style="display:block;font-size:15px;font-weight:800;color:#f8fafc;text-decoration:none;border-bottom:1px solid ${{color}};margin:2px 0;line-height:1.3">${{p.name}}</a>
+            <div style="font-size:11px;color:#94a3b8"><span style="color:#4a90d9;font-weight:600">D</span> · City of Boston</div>
+          </div>
+        </div>`;
+      fillStatsPanelCharts(CITY_AGGS);
+    }};
+    btn.addEventListener('click', () => {{
+      if (_btnTimers.has(btn)) {{
+        clearTimeout(_btnTimers.get(btn)); _btnTimers.delete(btn);
+        _renderDrilldown(p.name, p.title, 'City of Boston', 'D', p.url, p.photo, '', CITY_AGGS);
+      }} else {{
+        _btnTimers.set(btn, setTimeout(() => {{ _btnTimers.delete(btn); _showAtLarge(); }}, 300));
+      }}
+    }});
+    container.appendChild(btn);
+  }});
+}})();
+
+function filterBy(type, key, btn, d) {{
+  if (activeBtn === btn) {{ clearFilter(); return; }}
+  if (activeBtn) activeBtn.classList.remove("active");
+  activeBtn = btn; activeType = type; btn.classList.add("active");
+  const color = COLORS[type];
+  const theMap = getMap();
+  if (_ccLayer && theMap) {{ theMap.removeLayer(_ccLayer); _ccLayer = null; }}
+  if (type === "cc") {{
+    document.querySelectorAll(".district").forEach(el => {{ el.style.fillOpacity = "0.06"; el.style.opacity = "0.3"; }});
+    if (CC_GEO[key] && theMap) {{
+      _ccLayer = L.geoJSON(CC_GEO[key], {{ style: {{ fillColor: color, color: color, weight: 4, fillOpacity: 0.4, opacity: 1 }} }}).addTo(theMap);
+      if (window.innerWidth <= 640) {{
+        const sheetH = Math.round(window.innerHeight * 0.72);
+        theMap.fitBounds(_ccLayer.getBounds(), {{paddingTopLeft:[20,80], paddingBottomRight:[20, sheetH]}});
+      }} else {{ theMap.fitBounds(_ccLayer.getBounds(), {{padding:[60,60]}}); }}
+    }}
+  }} else {{
+    const matchClass = type + "-" + key;
+    const allBounds = [];
+    document.querySelectorAll(".district").forEach(el => {{
+      if (el.classList.contains(matchClass)) {{ el.style.fill = color; el.style.fillOpacity = "0.75"; el.style.opacity = "1"; }}
+      else {{ el.style.fill = ""; el.style.fillOpacity = "0.06"; el.style.opacity = "0.4"; }}
+    }});
+    if (theMap) {{
+      theMap.eachLayer(layer => {{
+        if (layer.feature && layer.getElement) {{
+          const el = layer.getElement();
+          if (el && (el.className.baseVal||"").includes(matchClass)) {{ try {{ allBounds.push(layer.getBounds()); }} catch(e) {{}} }}
+        }}
+      }});
+      if (allBounds.length > 0) {{
+        let combined = allBounds[0];
+        for (let i=1;i<allBounds.length;i++) combined=combined.extend(allBounds[i]);
+        if (window.innerWidth <= 640) {{
+          const sheetH = Math.round(window.innerHeight * 0.72);
+          theMap.fitBounds(combined, {{paddingTopLeft:[20,80], paddingBottomRight:[20, sheetH]}});
+        }} else {{ theMap.fitBounds(combined, {{padding:[60,60]}}); }}
+      }}
+    }}
+  }}
+  showStatsPanel(d, color, type);
+}}
+
+const AGE_ORDER = ["Under 65","65\u201374","75\u201384","85+"];
+function makeDonut(dataObj, colors, keyOrder) {{
+  let entries = Object.entries(dataObj).filter(([k,v]) => {{ const n=parseInt(v); return n>0; }});
+  if (keyOrder) entries.sort((a,b) => {{ const ai=keyOrder.indexOf(a[0]),bi=keyOrder.indexOf(b[0]); return (ai===-1?999:ai)-(bi===-1?999:bi); }});
+  if (!entries.length) return "<div style='color:#64748b;font-size:11px'>No data</div>";
+  const total = entries.reduce((s,[k,v]) => s+parseInt(v), 0);
+  const cx=55,cy=55,ro=48,ri=28;
+  let angle=-Math.PI/2, paths="", legend="";
+  entries.forEach(([label,valStr],i) => {{
+    const count=parseInt(valStr), pct=count/total, sweep=2*Math.PI*pct;
+    const x1=cx+ro*Math.cos(angle),y1=cy+ro*Math.sin(angle);
+    const x2=cx+ro*Math.cos(angle+sweep),y2=cy+ro*Math.sin(angle+sweep);
+    const x3=cx+ri*Math.cos(angle+sweep),y3=cy+ri*Math.sin(angle+sweep);
+    const x4=cx+ri*Math.cos(angle),y4=cy+ri*Math.sin(angle);
+    const large=sweep>Math.PI?1:0, color=colors[i%colors.length];
+    paths+=`<path d="M ${{x1.toFixed(2)}} ${{y1.toFixed(2)}} A ${{ro}} ${{ro}} 0 ${{large}} 1 ${{x2.toFixed(2)}} ${{y2.toFixed(2)}} L ${{x3.toFixed(2)}} ${{y3.toFixed(2)}} A ${{ri}} ${{ri}} 0 ${{large}} 0 ${{x4.toFixed(2)}} ${{y4.toFixed(2)}} Z" fill="${{color}}" stroke="#0f1117" stroke-width="1.5"/>`;
+    legend+=`<div style="display:flex;align-items:center;gap:5px;margin-bottom:4px">
+      <div style="width:9px;height:9px;border-radius:2px;background:${{color}};flex-shrink:0"></div>
+      <span style="color:#e2e8f0;font-size:10.5px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${{label}}</span>
+      <span style="color:#94a3b8;font-size:10px;flex-shrink:0;margin-left:4px">${{(pct*100).toFixed(0)}}%</span></div>`;
+    angle+=sweep;
+  }});
+  return `<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
+    <svg width="110" height="110" viewBox="0 0 110 110" style="flex-shrink:0">${{paths}}</svg>
+    <div style="flex:1;min-width:0">${{legend}}</div></div>`;
+}}
+
+const GCOL=["#7dd3fc","#f9a8d4","#a5b4fc","#6ee7b7","#fde68a","#d9f99d"];
+const ECOL=["#f59e0b","#34d399","#60a5fa","#f472b6","#a78bfa","#fb923c","#4ade80","#f87171","#e879f9","#38bdf8","#facc15","#86efac"];
+const ACOL=["#38bdf8","#818cf8","#fb7185","#fbbf24","#34d399","#e879f9","#f97316","#a3e635","#e2e8f0","#f472b6","#4ade80","#c084fc"];
+const MCOL=["#06b6d4","#8b5cf6","#10b981","#f59e0b","#ef4444","#ec4899","#84cc16","#f97316","#6366f1","#14b8a6"];
+const ICOL=["#ef4444","#fb923c","#fbbf24","#34d399","#94a3b8"];
+const RCOL=["#ef4444","#f97316","#fbbf24","#a78bfa","#60a5fa","#34d399","#f472b6","#fb923c"];
+
+function makeCard(first, last, party, dist, url, photoUrl, label) {{
+  const col = partyColor(party);
+  const initials = ((first||'')[0]||'') + ((last||'')[0]||'');
+  return `<div style="display:flex;align-items:center;gap:10px;background:#1a1d2e;border-radius:10px;
+    padding:9px;border:1px solid #2a3050;margin-bottom:5px;">
+    <div style="position:relative;flex-shrink:0">
+      <img src="${{photoUrl}}" style="width:44px;height:44px;border-radius:50%;object-fit:cover;object-position:top;border:2px solid ${{col}};"
+           onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"/>
+      <div style="display:none;width:44px;height:44px;border-radius:50%;background:#0f1117;border:2px solid ${{col}};
+           align-items:center;justify-content:center;font-size:13px;font-weight:800;color:${{col}}">${{initials.toUpperCase()}}</div>
+    </div>
+    <div style="flex:1;min-width:0">
+      <div style="font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:2px">${{label}}</div>
+      <a href="${{url}}" target="_blank" style="display:block;font-size:12px;font-weight:800;color:#f8fafc;
+         text-decoration:none;border-bottom:1px solid ${{col}};line-height:1.3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+        ${{first}} ${{last}}</a>
+      <div style="font-size:10px;color:#94a3b8;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+        ${{dist}} &nbsp;·&nbsp; <span style="color:${{col}};font-weight:600">${{party}}</span></div>
+    </div>
+  </div>`;
+}}
+
+function repPhotoUrl(url) {{ if (!url) return ''; const id=url.trim().replace(/\/$/,'').split('/').pop(); return `https://malegislature.gov/Legislators/Profile/170/${{id}}.jpg`; }}
+function conPhotoUrl(num, last) {{ if (!num||!last) return ''; return `https://ziplook.house.gov/zip/pictures/ma${{String(num).padStart(2,'0')}}_${{last.toLowerCase()}}.jpg`; }}
+
+function makeTeamCards(d) {{
+  let html = '';
+  if (d.con_last) html += makeCard(d.con_first||'', d.con_last, d.con_party||'', d.con_dist||'', d.con_url||'', conPhotoUrl(d.con_dist_num, d.con_last), 'U.S. Representative');
+  html += makeCard('Elizabeth','Warren','D','Senior U.S. Senator · Massachusetts','https://www.warren.senate.gov/','https://www.govtrack.us/static/legislator-photos/412542-100px.jpeg','U.S. Senator');
+  html += makeCard('Edward','Markey','D','Junior U.S. Senator · Massachusetts','https://www.markey.senate.gov/','https://upload.wikimedia.org/wikipedia/commons/thumb/9/94/Edward_Markey%2C_official_portrait%2C_114th_Congress.jpg/250px-Edward_Markey%2C_official_portrait%2C_114th_Congress.jpg','U.S. Senator');
+  if (d.sen_last) html += makeCard(d.sen_first||'', d.sen_last, d.sen_party||'', d.sen_dist||'', d.sen_url||'', repPhotoUrl(d.sen_url), 'State Senator');
+  if (d.rep_last) html += makeCard(d.rep_first||'', d.rep_last, d.rep_party||'', d.rep_dist||'', d.rep_url||'', repPhotoUrl(d.rep_url), 'State Representative');
+  if (d.cc_name && d.cc_name !== 'nan' && d.cc_name.trim()) {{
+    const parts = (d.cc_name||'').trim().split(' ');
+    html += makeCard(parts[0]||'', parts.slice(1).join(' ')||'', 'D', 'District '+(d.cc_dist||''), d.cc_url||'', d.cc_image||'', 'City Councilor');
+  }}
+  return html;
+}}
+
+function makeTeamCardsExcluding(d, excludeName) {{
+  const ex = (excludeName||'').trim().toLowerCase();
+  let html = '';
+  if (d.con_last) {{ const n=(d.con_first+' '+d.con_last).trim().toLowerCase(); if (n!==ex) html+=makeCard(d.con_first||'', d.con_last, d.con_party||'', d.con_dist||'', d.con_url||'', conPhotoUrl(d.con_dist_num, d.con_last), 'U.S. Representative'); }}
+  if (ex!=='elizabeth warren') html+=makeCard('Elizabeth','Warren','D','Senior U.S. Senator · Massachusetts','https://www.warren.senate.gov/','https://www.govtrack.us/static/legislator-photos/412542-100px.jpeg','U.S. Senator');
+  if (ex!=='edward markey') html+=makeCard('Edward','Markey','D','Junior U.S. Senator · Massachusetts','https://www.markey.senate.gov/','https://upload.wikimedia.org/wikipedia/commons/thumb/9/94/Edward_Markey%2C_official_portrait%2C_114th_Congress.jpg/250px-Edward_Markey%2C_official_portrait%2C_114th_Congress.jpg','U.S. Senator');
+  if (d.sen_last) {{ const n=(d.sen_first+' '+d.sen_last).trim().toLowerCase(); if (n!==ex) html+=makeCard(d.sen_first||'', d.sen_last, d.sen_party||'', d.sen_dist||'', d.sen_url||'', repPhotoUrl(d.sen_url), 'State Senator'); }}
+  if (d.rep_last) {{ const n=(d.rep_first+' '+d.rep_last).trim().toLowerCase(); if (n!==ex) html+=makeCard(d.rep_first||'', d.rep_last, d.rep_party||'', d.rep_dist||'', d.rep_url||'', repPhotoUrl(d.rep_url), 'State Representative'); }}
+  if (d.cc_name && d.cc_name!=='nan' && d.cc_name.trim()) {{
+    const n=d.cc_name.trim().toLowerCase();
+    if (n!==ex) {{ const parts=d.cc_name.trim().split(' '); html+=makeCard(parts[0]||'', parts.slice(1).join(' ')||'', 'D', 'District '+(d.cc_dist||''), d.cc_url||'', d.cc_image||'', 'City Councilor'); }}
+  }}
+  return html;
+}}
+
+// ── Sidebar service blocks with savings ───────────────────────────────────────
+const NH_HR = 72.12, HC_HR = 28.00, SAV_HR = 44.12;
+
+function makeServiceBlocks(meals, hrs) {{
+  if (!meals && !hrs) {{ document.getElementById("sp-services").innerHTML = ""; return; }}
+  const mealSavSide = meals > 0 ? Math.round(meals * 11) : 0;
+
+  // Top row: Savings card + Hours card side by side
+  let topRow = "";
+  if (hrs > 0) {{
+    const sv = Math.round(hrs * SAV_HR), nh = Math.round(hrs * NH_HR), cb = Math.round(hrs * HC_HR);
+    const cbW = Math.round((cb / nh) * 100);
+    const savCard = `
+      <div style="flex:1;background:rgba(4,20,10,.7);border:1px solid rgba(52,211,153,.3);border-radius:8px;padding:10px;text-align:center">
+        <div style="font-size:7px;color:#6ee7b7;text-transform:uppercase;letter-spacing:.1em;margin-bottom:3px">Estimated Annual Savings</div>
+        <div style="font-size:28px;font-weight:900;color:#34d399;line-height:1;margin-bottom:8px">$${{sv.toLocaleString()}}</div>
+        <div style="background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.4);border-radius:5px;padding:5px 8px;display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+          <div style="font-size:7px;font-weight:700;color:#fca5a5;text-transform:uppercase">Without CBES</div>
+          <div style="font-size:12px;font-weight:900;color:#ef4444">$${{nh.toLocaleString()}}</div>
+        </div>
+        <div style="width:${{cbW}}%;background:rgba(125,211,252,.12);border:1px solid rgba(125,211,252,.35);border-radius:5px;padding:5px 8px;display:flex;justify-content:space-between;align-items:center;min-width:fit-content">
+          <div style="font-size:7px;font-weight:700;color:#7dd3fc;text-transform:uppercase;white-space:nowrap">With CBES</div>
+          <div style="font-size:12px;font-weight:900;color:#7dd3fc;margin-left:6px">$${{cb.toLocaleString()}}</div>
+        </div>
+      </div>`;
+    const hrsCard = `
+      <div style="background:#1a0d06;border-radius:8px;padding:10px;text-align:center;border:1px solid rgba(251,146,60,0.35);display:flex;flex-direction:column;justify-content:center">
+        <div style="font-size:22px;font-weight:800;color:#fb923c;line-height:1">${{Math.round(hrs).toLocaleString()}}</div>
+        <div style="font-size:9px;color:#fdba74;text-transform:uppercase;letter-spacing:0.1em;margin-top:4px">Home Care Hours</div>
+      </div>`;
+    topRow = `<div style="display:flex;gap:8px;margin-bottom:8px">${{savCard}}${{hrsCard}}</div>`;
+  }}
+
+  // Bottom: Meals card with $ saved on top, count below
+  const mealsRow = meals > 0 ? `
+    <div style="background:#071a0f;border-radius:8px;padding:10px;text-align:center;border:1px solid rgba(52,211,153,0.35);">
+      ${{mealSavSide > 0 ? `<div style="font-size:18px;font-weight:900;color:#fbbf24;line-height:1;margin-bottom:4px">$${{mealSavSide.toLocaleString()}} saved</div>` : ''}}
+      <div style="font-size:22px;font-weight:800;color:#34d399;line-height:1">${{Math.round(meals).toLocaleString()}}</div>
+      <div style="font-size:9px;color:#6ee7b7;text-transform:uppercase;letter-spacing:0.1em;margin-top:4px">Home Delivered Meals</div>
+    </div>` : "";
+
+  document.getElementById("sp-services").innerHTML = topRow + mealsRow;
+}}
+
+function fillStatsPanelCharts(d) {{
+  const lives = d.lives_touched || d.total;
+  document.getElementById("sp-total-block").innerHTML = `
+    <div style="font-size:36px;font-weight:800;color:#7dd3fc;line-height:1">${{d.total.toLocaleString()}}</div>
+    <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.1em;margin-top:3px">Consumers Served</div>
+    <div style="margin-top:10px;padding-top:10px;border-top:1px solid #2a3050">
+      <div style="font-size:28px;font-weight:800;color:#a78bfa;line-height:1">${{lives.toLocaleString()}}</div>
+      <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.1em;margin-top:3px">Caregivers and Consumers Impacted</div>
+    </div>`;
+  makeServiceBlocks(d.total_meals || 0, d.total_care_hours || 0);
+  const r = d.r_total || 0;
+  if (r > 0) {{
+    document.getElementById("sp-reports").innerHTML =
+      `<div style="border-top:2px solid #ef4444;padding-top:12px;margin-top:4px;">
+        <div style="font-size:9px;font-weight:800;color:#ef4444;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px;">&#9888; Elder Abuse &amp; Exploitation</div>
+        <div style="background:#1e1018;border:1px solid rgba(239,68,68,0.2);border-radius:8px;padding:10px;text-align:center;margin-bottom:10px;">
+          <div style="font-size:28px;font-weight:800;color:#ef4444;line-height:1">${{r.toLocaleString()}}</div>
+          <div style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.1em;margin-top:2px">Reports Filed</div>
+        </div>
+        <div style="font-size:9px;font-weight:700;color:#ef4444;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:6px;padding-bottom:4px;border-bottom:1px solid #1e2235;">Allegation Type</div>
+        ${{makeDonut(d.r_allegation||{{}}, RCOL)}}
+      </div>`;
+  }} else {{ document.getElementById("sp-reports").innerHTML = ""; }}
+  document.getElementById("sp-gender").innerHTML     = makeDonut(d.gender||{{}},     GCOL);
+  document.getElementById("sp-ethnicity").innerHTML  = makeDonut(d.ethnicity||{{}},  ECOL);
+  document.getElementById("sp-age").innerHTML        = makeDonut(d.age||{{}},        ACOL, AGE_ORDER);
+  document.getElementById("sp-masshealth").innerHTML = makeDonut(d.masshealth||{{}}, MCOL);
+  document.getElementById("sp-income").innerHTML     = makeDonut(d.income||{{}}, ICOL);
+  document.getElementById("stats-panel").classList.add("open");
+}}
+
+function showDistrictPanel(dist_code) {{
+  const d = DISTRICT_DATA[dist_code];
+  if (!d || !d.total) return;
+  document.getElementById("filter-panel").classList.remove("open");
+  document.getElementById("sp-leg-card").innerHTML = makeTeamCards(d);
+  fillStatsPanelCharts(d);
+}}
+
+function showStatsPanel(d, color, type) {{
+  const pc = partyColor(d.party);
+  const initials = (d.name.split(" ").map(w=>w[0]).join("")).slice(0,2).toUpperCase();
+  let primaryCard = `<div style="display:flex;align-items:center;gap:12px;border-left:4px solid ${{color}};padding-left:10px;margin-bottom:8px;">
+    <div style="position:relative;flex-shrink:0">
+      <img src="${{d.photo}}" style="width:52px;height:52px;border-radius:50%;object-fit:cover;object-position:top;border:2px solid ${{color}};"
+           onerror="this.style.display='none';this.nextElementSibling.style.display='flex';" />
+      <div style="display:none;width:52px;height:52px;border-radius:50%;background:#1e2235;border:2px solid ${{color}};align-items:center;justify-content:center;font-size:16px;font-weight:800;color:${{color}}">${{initials}}</div>
+    </div>
+    <div>
+      <div style="font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:0.1em">${{d.dist}}</div>
+      <a href="${{d.url}}" target="_blank" style="display:block;font-size:15px;font-weight:800;color:#f8fafc;text-decoration:none;border-bottom:1px solid ${{color}};margin:2px 0;line-height:1.3">${{d.name}}</a>
+      <div style="font-size:11px;color:#94a3b8"><span style="color:${{pc}};font-weight:600">${{d.party}}</span></div>
+    </div>
+  </div>`;
+  document.getElementById("sp-leg-card").innerHTML = primaryCard;
+  const aggD = {{
+    total: d.total, lives_touched: d.lives_touched,
+    total_meals: d.total_meals||0, total_care_hours: d.total_care_hours||0,
+    r_total: d.r_total||0, r_allegation: d.r_allegation||{{}},
+    gender: d.gender, ethnicity: d.ethnicity, age: d.age, masshealth: d.masshealth, income: d.income||{{}}
+  }};
+  fillStatsPanelCharts(aggD);
+}}
+
+const _clickTimers = {{}};
+function initDistrictClicks() {{
+  const theMap = getMap();
+  if (!theMap) {{ setTimeout(initDistrictClicks, 300); return; }}
+  theMap.doubleClickZoom.disable();
+  theMap.eachLayer(function(layer) {{
+    if (layer.feature && layer.feature.properties && layer.feature.properties.dist_code) {{
+      const dc = layer.feature.properties.dist_code;
+      layer.on('click', function(e) {{
+        L.DomEvent.stopPropagation(e);
+        if (_clickTimers[dc]) {{
+          clearTimeout(_clickTimers[dc]); delete _clickTimers[dc];
+          const theMap2 = getMap();
+          if (theMap2) {{ try {{ theMap2.fitBounds(layer.getBounds(), {{padding:[80,80], animate:true, duration:0.5}}); }} catch(err) {{}} }}
+          setTimeout(() => showDrilldown(dc), 480);
+        }} else {{
+          _clickTimers[dc] = setTimeout(function() {{ delete _clickTimers[dc]; showDistrictPanel(dc); }}, 320);
+        }}
+      }});
+    }}
+  }});
+}}
+setTimeout(initDistrictClicks, 600);
+
+document.getElementById("filter-toggle").addEventListener("click", function() {{
+  const fp = document.getElementById("filter-panel");
+  fp.classList.toggle("open");
+  this.textContent = fp.classList.contains("open") ? "✕" : "☰";
+}});
+
+function clearFilter() {{
+  if (activeBtn) activeBtn.classList.remove("active");
+  activeBtn = null; activeType = null;
+  const theMap = getMap();
+  if (_ccLayer && theMap) {{ theMap.removeLayer(_ccLayer); _ccLayer = null; }}
+  document.querySelectorAll(".district").forEach(el => {{ el.style.fill=""; el.style.fillOpacity=""; el.style.opacity="1"; }});
+  document.getElementById("stats-panel").classList.remove("open");
+  closeDrilldown();
+}}
+
+// ── DRILLDOWN ────────────────────────────────────────────────────────────────
+const DD_SKIP = /^(unknown|missing|missing gender|nan|none|other unknown|)$/i;
+
+function makeDrilldownDonut(dataObj, colors, keyOrder, size) {{
+  size = size || 110;
+  let entries = Object.entries(dataObj).filter(([k,v]) => {{ const n=parseInt(v); return n>0 && !DD_SKIP.test(k.trim()); }});
+  if (keyOrder) entries.sort((a,b) => {{ const ai=keyOrder.indexOf(a[0]),bi=keyOrder.indexOf(b[0]); return (ai===-1?999:ai)-(bi===-1?999:bi); }});
+  if (!entries.length) return '<div style="color:#4b5563;font-size:11px;text-align:center;padding:20px 0">No data</div>';
+  const total = entries.reduce((s,[k,v])=>s+parseInt(v),0);
+  const cx=size/2, cy=size/2, ro=size/2-3, ri=size/2-18;
+  let angle=-Math.PI/2, paths='';
+  const topEntry = entries[0];
+  const topPct   = Math.round(parseInt(topEntry[1])/total*100);
+  const topLabel = topEntry[0].length > 9 ? topEntry[0].split(/[\s\/]/)[0] : topEntry[0];
+  entries.forEach(([label,valStr],i)=>{{
+    const count=parseInt(valStr),pct=count/total,sweep=2*Math.PI*pct;
+    if (sweep < 0.02) {{ angle+=sweep; return; }}
+    const x1=cx+ro*Math.cos(angle),y1=cy+ro*Math.sin(angle);
+    const x2=cx+ro*Math.cos(angle+sweep),y2=cy+ro*Math.sin(angle+sweep);
+    const x3=cx+ri*Math.cos(angle+sweep),y3=cy+ri*Math.sin(angle+sweep);
+    const x4=cx+ri*Math.cos(angle),y4=cy+ri*Math.sin(angle);
+    const large=sweep>Math.PI?1:0,color=colors[i%colors.length];
+    paths+=`<path d="M ${{x1.toFixed(1)}} ${{y1.toFixed(1)}} A ${{ro}} ${{ro}} 0 ${{large}} 1 ${{x2.toFixed(1)}} ${{y2.toFixed(1)}} L ${{x3.toFixed(1)}} ${{y3.toFixed(1)}} A ${{ri}} ${{ri}} 0 ${{large}} 0 ${{x4.toFixed(1)}} ${{y4.toFixed(1)}} Z" fill="${{color}}" stroke="rgba(8,10,20,0.6)" stroke-width="1.5"><title>${{label}}: ${{(pct*100).toFixed(0)}}%</title></path>`;
+    angle+=sweep;
+  }});
+  const legend = entries.map(([label,valStr],i) => {{
+    const pct=parseInt(valStr)/total, color=colors[i%colors.length];
+    const short = label.length > 22 ? label.slice(0,21)+'…' : label;
+    return `<div style="display:flex;align-items:center;gap:5px;margin-bottom:3.5px;min-width:0">
+      <div style="width:8px;height:8px;border-radius:2px;background:${{color}};flex-shrink:0;box-shadow:0 0 4px ${{color}}88"></div>
+      <span style="color:#cbd5e1;font-size:9px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.3">${{short}}</span>
+      <span style="color:#94a3b8;font-size:9px;font-weight:700;flex-shrink:0;margin-left:2px">${{(pct*100).toFixed(0)}}%</span></div>`;
+  }}).join('');
+  return `<div style="display:flex;flex-direction:column;align-items:center;gap:8px;width:100%">
+    <div style="position:relative;width:100%;aspect-ratio:1">
+      <svg width="100%" height="100%" viewBox="0 0 ${{size}} ${{size}}" style="display:block">${{paths}}</svg>
+      <div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:none;text-align:center;padding:0 6px;">
+        <div style="font-size:18px;font-weight:900;color:#f1f5f9;line-height:1">${{topPct}}%</div>
+        <div style="font-size:8px;color:#64748b;text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;line-height:1.2;word-break:break-word">${{topLabel}}</div>
+      </div>
+    </div>
+    <div style="width:100%">${{legend}}</div>
+  </div>`;
+}}
+
+function showDrilldown(dist_code) {{
+  try {{
+    const d = DISTRICT_DATA[dist_code];
+    if (!d) {{ console.warn('showDrilldown: no data for', dist_code); return; }}
+    const heroPhoto = d.rep_last ? repPhotoUrl(d.rep_url) : d.sen_last ? repPhotoUrl(d.sen_url) : d.con_last ? conPhotoUrl(d.con_dist_num, d.con_last) : '';
+    const heroName  = d.rep_last ? (d.rep_first+' '+d.rep_last) : d.sen_last ? (d.sen_first+' '+d.sen_last) : d.con_last ? (d.con_first+' '+d.con_last) : '';
+    const heroRole  = d.rep_last ? 'State Representative' : d.sen_last ? 'State Senator' : d.con_last ? 'U.S. Representative' : '';
+    const heroDist  = d.rep_last ? d.rep_dist : d.sen_last ? d.sen_dist : d.con_last ? d.con_dist : '';
+    const heroParty = d.rep_last ? d.rep_party : d.sen_last ? d.sen_party : d.con_last ? d.con_party : 'D';
+    const heroUrl   = d.rep_last ? d.rep_url : d.sen_last ? d.sen_url : d.con_last ? d.con_url : '';
+    _renderDrilldown(heroName, heroRole, heroDist, heroParty, heroUrl, heroPhoto, dist_code, d);
+  }} catch(err) {{ console.error('showDrilldown error:', err); }}
+}}
+
+function showDrilldownForLeg(legD, type, color) {{
+  try {{
+    const roleMap = {{con:'U.S. Representative', sen:'State Senator', rep:'State Representative', cc:'City Councilor'}};
+    const photoFn = type==='con'
+      ? () => conPhotoUrl(legD.dist_codes.length ? (DISTRICT_DATA[String(legD.dist_codes[0])]||{{}}).con_dist_num||'' : '', legD.name.split(' ').pop())
+      : () => repPhotoUrl(legD.url);
+    const data = {{
+      total: legD.total, lives_touched: legD.lives_touched,
+      total_meals: legD.total_meals||0, total_care_hours: legD.total_care_hours||0,
+      r_total: legD.r_total||0, r_allegation: legD.r_allegation||{{}},
+      gender: legD.gender, ethnicity: legD.ethnicity, age: legD.age,
+      masshealth: legD.masshealth, income: legD.income||{{}}
+    }};
+    _renderDrilldown(legD.name, roleMap[type]||'', legD.dist, legD.party, legD.url, legD.photo||photoFn(), '', data);
+  }} catch(err) {{ console.error('showDrilldownForLeg error:', err); }}
+}}
+
+function _renderDrilldown(heroName, heroRole, heroDist, heroParty, heroUrl, heroPhoto, badge, d) {{
+  const heroCol  = partyColor(heroParty);
+  const heroInit = heroName.split(' ').map(w=>w[0]||'').join('').slice(0,2).toUpperCase();
+  const lives    = d.lives_touched || d.total;
+  const meals    = d.total_meals || 0;
+  const hrs      = d.total_care_hours || 0;
+  const reports  = d.r_total || 0;
+
+  const GENDER_LABELS = {{'F':'Female','M':'Male','f':'Female','m':'Male'}};
+  const remapGender = obj => Object.fromEntries(Object.entries(obj||{{}}).map(([k,v]) => [GENDER_LABELS[k]||k, v]));
+
+  const genderSvg = makeDrilldownDonut(remapGender(d.gender)||{{}}, GCOL, null, 140);
+  const ethnSvg   = makeDrilldownDonut(d.ethnicity||{{}}, ECOL, null, 140);
+  const ageSvg    = makeDrilldownDonut(d.age||{{}}, ACOL, AGE_ORDER, 140);
+  const massSvg   = makeDrilldownDonut(d.masshealth||{{}}, MCOL, null, 140);
+  const incomeSvg = makeDrilldownDonut(d.income||{{}}, ICOL, null, 140);
+
+  // ── Savings (declared once, no duplicates) ───────────────────────────────
+  const savings  = hrs > 0 ? Math.round(hrs * 44.12) : 0;
+  const nhCost   = hrs > 0 ? Math.round(hrs * 72.12) : 0;
+  const cbesCost = hrs > 0 ? Math.round(hrs * 28.00) : 0;
+  const mealSav  = meals > 0 ? Math.round(meals * 11) : 0;
+
+  // ── Metrics row: Savings | Hours | Meals | Older Adults Protected ───────────
+  const savingsChunk = savings > 0 ? `
+    <div class="dd-glass dd-metric" style="flex:2;min-width:200px;border-color:rgba(52,211,153,0.35);background:rgba(4,20,10,0.6);padding:14px 16px;">
+      <div style="text-align:center;margin-bottom:10px">
+        <div style="font-size:9px;color:#6ee7b7;text-transform:uppercase;letter-spacing:.1em;margin-bottom:3px">Estimated Annual Savings</div>
+        <div class="dd-metric-num" style="color:#34d399">$${{savings.toLocaleString()}}</div>
+      </div>
+      <div style="background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.4);border-radius:6px;padding:7px 10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">
+        <div style="font-size:7px;font-weight:700;color:#fca5a5;text-transform:uppercase">Without CBES — Nursing Home</div>
+        <div style="font-size:14px;font-weight:900;color:#ef4444">$${{nhCost.toLocaleString()}}</div>
+      </div>
+      <div style="width:${{Math.round(cbesCost/nhCost*100)}}%;background:rgba(125,211,252,.12);border:1px solid rgba(125,211,252,.35);border-radius:6px;padding:7px 10px;display:flex;justify-content:space-between;align-items:center;min-width:fit-content">
+        <div style="font-size:7px;font-weight:700;color:#7dd3fc;text-transform:uppercase;white-space:nowrap">With CBES — Home Care</div>
+        <div style="font-size:14px;font-weight:900;color:#7dd3fc;margin-left:8px">$${{cbesCost.toLocaleString()}}</div>
+      </div>
+    </div>` : '';
+
+  const hrsChunk = hrs > 0 ? `
+    <div class="dd-glass dd-metric" style="border-color:rgba(251,146,60,0.35);background:rgba(25,10,0,0.6);display:flex;flex-direction:column;align-items:center;justify-content:center;">
+      <div class="dd-metric-num" style="color:#fb923c">${{Math.round(hrs).toLocaleString()}}</div>
+      <div class="dd-metric-label" style="color:#fdba74">Home Care Hours</div>
+    </div>` : '';
+
+  const mealsChunk = meals > 0 ? `
+    <div class="dd-glass dd-metric" style="border-color:rgba(52,211,153,0.35);background:rgba(5,25,15,0.6);text-align:center;display:flex;flex-direction:column;align-items:center;justify-content:center;">
+      ${{mealSav > 0 ? `<div style="font-size:18px;font-weight:900;color:#fbbf24;line-height:1;margin-bottom:6px">$${{mealSav.toLocaleString()}} saved</div>` : ''}}
+      <div class="dd-metric-num" style="color:#34d399">${{Math.round(meals).toLocaleString()}}</div>
+      <div class="dd-metric-label" style="color:#6ee7b7">Home Delivered Meals</div>
+    </div>` : '';
+
+  const reportChunk = reports > 0 ? `
+    <div class="dd-glass dd-metric" style="border-color:rgba(239,68,68,0.4);background:rgba(30,5,5,0.6);display:flex;flex-direction:column;align-items:center;justify-content:center;">
+      <div class="dd-metric-num" style="color:#ef4444">${{reports.toLocaleString()}}</div>
+      <div class="dd-metric-label" style="color:#fca5a5">Older Adults Protected</div>
+    </div>` : '';
+
+  document.getElementById('dd-content').innerHTML = `
+    <div class="dd-aurora"></div>
+    <button class="dd-back" onclick="closeDrilldown()">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M10 3L5 8L10 13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      Back to map
+    </button>
+    ${{badge ? `<div class="dd-dist-badge">${{badge}}</div>` : ''}}
+    <div class="dd-layout">
+      <div class="dd-hero-col">
+        <div class="dd-hero-card dd-glass">
+          <div class="dd-photo-wrap">
+            <img id="dd-hero-img" src="${{heroPhoto}}" alt="${{heroName}}"
+              style="width:100%;height:100%;object-fit:cover;object-position:top;display:block;border-radius:12px 12px 0 0;"
+              onerror="this.style.display='none';document.getElementById('dd-hero-init').style.display='flex';" />
+            <div id="dd-hero-init" style="display:none;width:100%;height:100%;align-items:center;justify-content:center;
+              font-size:52px;font-weight:900;color:${{heroCol}};background:rgba(10,12,20,0.9);border-radius:12px 12px 0 0;">${{heroInit}}</div>
+            <div class="dd-photo-reflection"></div>
+            <div class="dd-photo-glow" style="background:radial-gradient(ellipse at 50% 100%, ${{heroCol}}55 0%, transparent 70%);"></div>
+          </div>
+          <div class="dd-hero-info">
+            <div style="font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:0.12em;margin-bottom:4px">${{heroRole}}</div>
+            <a href="${{heroUrl}}" target="_blank" style="display:block;font-size:16px;font-weight:900;color:#f8fafc;text-decoration:none;border-bottom:1px solid ${{heroCol}};line-height:1.25;margin-bottom:6px">${{heroName}}</a>
+            <div style="font-size:11px;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
+              ${{heroDist}} &nbsp;·&nbsp; <span style="color:${{heroCol}};font-weight:700">${{heroParty}}</span>
+            </div>
+          </div>
+        </div>
+        <div class="dd-glass dd-stat-tall" style="margin-top:10px;">
+          <div style="font-size:44px;font-weight:900;color:#7dd3fc;line-height:1;letter-spacing:-0.02em">${{d.total.toLocaleString()}}</div>
+          <div style="font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:0.1em;margin:4px 0 12px">Consumers Served</div>
+          <div style="font-size:30px;font-weight:800;color:#a78bfa;line-height:1">${{lives.toLocaleString()}}</div>
+          <div style="font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:0.1em;margin-top:4px">Individuals Impacted</div>
+        </div>
+      </div>
+      <div class="dd-right-col">
+        <div class="dd-metrics-row">${{savingsChunk}}${{hrsChunk}}${{mealsChunk}}${{reportChunk}}</div>
+        <div class="dd-charts-grid">
+          <div class="dd-chart-card dd-glass"><div class="dd-chart-title">Gender Identity</div>${{genderSvg}}</div>
+          <div class="dd-chart-card dd-glass"><div class="dd-chart-title">Ethnicity</div>${{ethnSvg}}</div>
+          <div class="dd-chart-card dd-glass"><div class="dd-chart-title">Age Group</div>${{ageSvg}}</div>
+          <div class="dd-chart-card dd-glass"><div class="dd-chart-title">MassHealth</div>${{massSvg}}</div>
+          <div class="dd-chart-card dd-glass"><div class="dd-chart-title">Income Level</div>${{incomeSvg}}</div>
+        </div>
+      </div>
+    </div>`;
+
+  const ov = document.getElementById('drilldown-overlay');
+  requestAnimationFrame(() => requestAnimationFrame(() => ov.classList.add('dd-open')));
+}}
+
+function closeDrilldown() {{
+  document.getElementById('drilldown-overlay').classList.remove('dd-open');
+}}
+document.addEventListener('keydown', e => {{ if (e.key === 'Escape') closeDrilldown(); }});
+</script>
+
+<!-- DRILLDOWN OVERLAY -->
+<div id="drilldown-overlay" style="position:fixed;inset:0;z-index:4000;display:flex;align-items:center;justify-content:center;background:rgba(4,6,16,0.88);backdrop-filter:blur(18px) saturate(1.4);-webkit-backdrop-filter:blur(18px) saturate(1.4);">
+  <div id="dd-content" style="width:min(1100px,96vw);max-height:96vh;overflow-y:auto;padding:24px;position:relative;font-family:'DM Sans',sans-serif;"></div>
+</div>
+
+<style>
+#drilldown-overlay {{ opacity:0;visibility:hidden;pointer-events:none;transition:opacity 0.35s ease, visibility 0s linear 0.35s; }}
+#drilldown-overlay #dd-content {{ transform:scale(0.95) translateY(16px);transition:transform 0.4s cubic-bezier(0.22,1,0.36,1); }}
+#drilldown-overlay.dd-open {{ opacity:1;visibility:visible;pointer-events:auto;transition:opacity 0.35s ease, visibility 0s linear 0s; }}
+#drilldown-overlay.dd-open #dd-content {{ transform:scale(1) translateY(0); }}
+.dd-aurora {{ position:fixed;inset:0;pointer-events:none;z-index:-1;
+  background:radial-gradient(ellipse 60% 40% at 20% 30%, rgba(99,102,241,0.18) 0%, transparent 70%),
+             radial-gradient(ellipse 50% 35% at 80% 70%, rgba(6,182,212,0.14) 0%, transparent 70%),
+             radial-gradient(ellipse 40% 30% at 60% 20%, rgba(167,139,250,0.12) 0%, transparent 70%);
+  animation: dd-aurora-drift 8s ease-in-out infinite alternate; }}
+@keyframes dd-aurora-drift {{ from {{ opacity:0.7; transform:scale(1); }} to {{ opacity:1; transform:scale(1.06) rotate(1deg); }} }}
+.dd-glass {{ background:rgba(15,17,30,0.55);border:1px solid rgba(255,255,255,0.08);border-radius:16px;
+  backdrop-filter:blur(12px) saturate(1.2);-webkit-backdrop-filter:blur(12px) saturate(1.2);
+  box-shadow:0 8px 32px rgba(0,0,0,0.5),0 1px 0 rgba(255,255,255,0.06) inset,0 0 0 0.5px rgba(255,255,255,0.04) inset; }}
+.dd-back {{ position:absolute;top:0;left:0;display:flex;align-items:center;gap:6px;
+  background:rgba(15,17,30,0.7);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:7px 14px;
+  color:#94a3b8;font-size:11px;font-weight:700;cursor:pointer;font-family:'DM Sans',sans-serif;letter-spacing:0.05em;transition:color 0.15s,background 0.15s; }}
+.dd-back:hover {{ color:#f0f4ff;background:rgba(30,34,60,0.9); }}
+.dd-dist-badge {{ position:absolute;top:4px;right:0;font-size:10px;color:#475569;letter-spacing:0.2em;text-transform:uppercase;font-family:'DM Sans',sans-serif; }}
+.dd-layout {{ display:grid;grid-template-columns:220px 1fr;gap:14px;margin-top:36px;perspective:1200px; }}
+.dd-hero-col {{ display:flex;flex-direction:column;gap:0; }}
+.dd-hero-card {{ border-radius:16px;overflow:hidden;animation:dd-slide-left 0.5s cubic-bezier(0.22,1,0.36,1) both;animation-delay:0.05s;transform-style:preserve-3d; }}
+.dd-hero-card:hover {{ transform:rotateY(2deg) rotateX(-1deg) translateZ(4px);transition:transform 0.3s ease; }}
+.dd-photo-wrap {{ position:relative;height:200px;overflow:hidden;border-radius:12px 12px 0 0; }}
+.dd-photo-reflection {{ position:absolute;bottom:0;left:0;right:0;height:60px;background:linear-gradient(to bottom, transparent, rgba(10,12,24,0.95));pointer-events:none; }}
+.dd-photo-glow {{ position:absolute;bottom:-10px;left:0;right:0;height:80px;pointer-events:none; }}
+.dd-hero-info {{ padding:12px 14px 14px; }}
+.dd-stat-tall {{ padding:16px;text-align:center;animation:dd-slide-left 0.5s cubic-bezier(0.22,1,0.36,1) both;animation-delay:0.12s;margin-top:10px; }}
+.dd-right-col {{ display:flex;flex-direction:column;gap:12px; }}
+.dd-metrics-row {{ display:flex;gap:10px;flex-wrap:wrap;animation:dd-slide-up 0.5s cubic-bezier(0.22,1,0.36,1) both;animation-delay:0.08s; }}
+.dd-metric {{ flex:1;min-width:100px;padding:14px 16px;text-align:center;transform-style:preserve-3d;transition:transform 0.25s ease,box-shadow 0.25s ease; }}
+.dd-metric:hover {{ transform:translateZ(8px) translateY(-2px);box-shadow:0 16px 40px rgba(0,0,0,0.6),0 1px 0 rgba(255,255,255,0.08) inset; }}
+.dd-metric-num {{ font-size:28px;font-weight:900;line-height:1;letter-spacing:-0.02em; }}
+.dd-metric-label {{ font-size:9px;text-transform:uppercase;letter-spacing:0.1em;margin-top:5px; }}
+.dd-charts-grid {{ display:grid;grid-template-columns:repeat(5,1fr);gap:10px;animation:dd-slide-up 0.55s cubic-bezier(0.22,1,0.36,1) both;animation-delay:0.15s; }}
+.dd-chart-card {{ padding:16px 14px 18px;display:flex;flex-direction:column;transform-style:preserve-3d;transition:transform 0.25s ease,box-shadow 0.25s ease; }}
+.dd-chart-card:hover {{ transform:translateZ(6px) translateY(-2px);box-shadow:0 16px 36px rgba(0,0,0,0.55),0 1px 0 rgba(255,255,255,0.08) inset; }}
+.dd-chart-title {{ font-size:9px;font-weight:800;color:#64748b;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:12px;text-align:center; }}
+@keyframes dd-slide-left {{ from {{ opacity:0; transform:translateX(-28px); }} to {{ opacity:1; transform:translateX(0); }} }}
+@keyframes dd-slide-up {{ from {{ opacity:0; transform:translateY(22px); }} to {{ opacity:1; transform:translateY(0); }} }}
+@media (max-width:700px) {{
+  .dd-layout {{ grid-template-columns:1fr; margin-top:44px; }}
+  .dd-charts-grid {{ grid-template-columns:repeat(2,1fr); }}
+  .dd-hero-col {{ flex-direction:row;flex-wrap:wrap;gap:10px; }}
+  .dd-hero-card {{ flex:1;min-width:160px; }}
+  .dd-stat-tall {{ flex:1;min-width:120px;margin-top:0; }}
+}}
+</style>
+"""))
+
+
+m.get_root().header.add_child(folium.Element(
+    '<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">'
+))
+
+cbes_icon = folium.DivIcon(
+    html=f'''<div onclick="window.open('https://centralboston.org/','_blank')" style="
+        background:#ffffff;border:3px solid #f59e0b;border-radius:50%;
+        width:48px;height:48px;display:flex;align-items:center;justify-content:center;
+        box-shadow:0 0 0 3px rgba(245,158,11,0.3), 0 4px 16px rgba(0,0,0,0.8);
+        overflow:hidden;cursor:pointer;">
+      <img src="{LOGO_URL}" style="width:36px;height:36px;object-fit:contain;" />
+    </div>''',
+    icon_size=(48, 48), icon_anchor=(24, 48),
+)
+folium.Marker(
+    location=[42.33042754679676, -71.08419604656878],
+    icon=cbes_icon,
+    tooltip=folium.Tooltip(
+        "<div style='font-family:DM Sans,sans-serif;background:#0f1117;color:#f0f4ff;"
+        "padding:8px 12px;border-radius:6px;border:1px solid #2a2d3a;font-size:12px;font-weight:700'>"
+        "Central Boston Elder Services</div>", sticky=True
+    ),
+).add_to(m)
+
+m.save(OUTPUT_FILE)
+
+with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
+    html = f.read()
+
+html = html.replace('bottom:30px;left:20px;z-index:1000;\n    background:#0f1117cc', 'id="logo-badge" style="bottom:30px;left:20px;z-index:1000;\n    background:#0f1117cc', 1)
+html = html.replace('bottom:30px;right:20px;z-index:1000;background:#0f1117', 'id="legend-panel" style="bottom:30px;right:20px;z-index:1000;background:#0f1117', 1)
+html = html.replace('top:20px;left:50%;transform:translateX(-50%);z-index:1000;', 'id="title-bar" style="top:20px;left:50%;transform:translateX(-50%);z-index:1000;', 1)
+html = html.replace('font-size:15px;letter-spacing:0.02em;white-space:nowrap">', 'class="title-text" style="font-size:15px;letter-spacing:0.02em;white-space:nowrap">', 1)
+html = html.replace('color:#6b7280;font-size:11px;margin-top:2px">Hover', 'class="title-sub" style="color:#6b7280;font-size:11px;margin-top:2px">Hover', 1)
+html = html.replace(
+    'Overview\n  </button>\n</div>',
+    'Overview\n  </button>\n  <a href="https://cbes-resource-locator.onrender.com/" target="_blank" style="background:rgba(52,211,153,.15);border:1px solid #34d399;border-radius:8px;padding:6px 14px;color:#34d399;font-size:11px;font-weight:700;font-family:\'DM Sans\',sans-serif;white-space:nowrap;flex-shrink:0;text-decoration:none;display:inline-block;">Find Help</a>\n</div>',
+    1
+)
+
+FIND_HELP_BTN = """
+<a href="https://cbes-resource-locator.onrender.com/" target="_blank" id="find-help-btn"
+   style="position:fixed;top:20px;right:20px;z-index:2000;
+          background:rgba(52,211,153,.15);border:1.5px solid #34d399;border-radius:8px;
+          padding:8px 18px;color:#34d399;font-size:12px;font-weight:700;
+          font-family:'DM Sans',sans-serif;text-decoration:none;
+          box-shadow:0 4px 16px rgba(0,0,0,0.4);backdrop-filter:blur(6px);">
+  Find Help
+</a>
+<style>@media(max-width:700px){#find-help-btn{top:auto!important;bottom:16px!important;right:16px!important;font-size:11px!important;padding:7px 14px!important;}}</style>"""
+html = html.replace("</body>", FIND_HELP_BTN + "</body>", 1)
+
+RESPONSIVE_CSS = """<style>
+@media (max-width:700px) {
+  #filter-panel { top:auto!important;bottom:0!important;left:0!important;right:0!important;width:100%!important;max-height:50vh!important;border-radius:16px 16px 0 0!important;transform:translateY(100%);transition:transform 0.3s ease; }
+  #filter-panel.open { transform:translateY(0); }
+  #filter-toggle { display:flex!important; }
+  #stats-panel { right:0!important;left:0!important;bottom:0!important;top:auto!important;width:100%!important;max-height:60vh!important;border-radius:16px 16px 0 0!important; }
+  #title-bar { padding:8px 12px!important;gap:8px!important;max-width:calc(100vw - 40px)!important; }
+  #title-bar .title-text { font-size:12px!important; }
+  #title-bar .title-sub  { display:none!important; }
+  #title-bar img         { height:22px!important; }
+  #legend-panel, #logo-badge { display:none!important; }
+}
+@media (min-width:701px) { #filter-toggle { display:none!important; } }
+</style>"""
+
+html = html.replace("</head>", RESPONSIVE_CSS + "</head>", 1)
+
+with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+    f.write(html)
+
+print(f"✓ Map saved to {OUTPUT_FILE} — open it in your browser!")
